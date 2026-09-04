@@ -102,11 +102,11 @@ def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
                           epochs=15, lr=5e-4, lambda_att=50.0,
-                          weight_decay=3e-4, checkpoint_dir='checkpoints',
-                          device='cpu'):
+                          weight_decay=3e-4, patience=15,
+                          checkpoint_dir='checkpoints', device='cpu'):
     """
     Train TriStreamAVNet with multi-task Huber + Geodesic loss and Cosine Annealing.
-    Saves best and latest model checkpoints as both .pth and .pkl.
+    Includes early stopping (patience) and saves best/latest checkpoints as .pth and .pkl.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     model.to(device)
@@ -115,6 +115,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float('inf')
+    epochs_without_improvement = 0
     history = {
         'train_loss': [],
         'val_loss': [],
@@ -192,8 +193,9 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
                   f"LR: {current_lr:.6f}")
 
             # Save best checkpoint
-            if np.isfinite(val_loss) and val_loss < best_val_loss:
+            if np.isfinite(val_loss) and val_loss < best_val_loss - 1e-4:
                 best_val_loss = val_loss
+                epochs_without_improvement = 0
                 best_pth = os.path.join(checkpoint_dir, 'best_avnet_tristream.pth')
                 best_pkl = os.path.join(checkpoint_dir, 'best_avnet_tristream.pkl')
 
@@ -210,6 +212,11 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
                 with open(best_pkl, 'wb') as f:
                     pickle.dump(checkpoint_data, f)
                 print(f"  --> Saved new best checkpoint (Val Loss: {val_loss:.5f}) to {best_pth} and {best_pkl}")
+            else:
+                epochs_without_improvement += 1
+                if patience is not None and epochs_without_improvement >= patience:
+                    print(f"\n[Early Stopping] Val loss did not improve for {patience} consecutive epochs. Best Val Loss: {best_val_loss:.5f}. Stopping at epoch {epoch+1}.")
+                    break
         else:
             print(f"Epoch [{epoch+1:02d}/{epochs:02d}] Train Loss: {epoch_train_loss:.5f} | LR: {current_lr:.6f}")
 
