@@ -31,83 +31,97 @@ class SelfAttentionPooling(nn.Module):
 
 class TriStreamAVNet(nn.Module):
     """
-    Multi-Modal Tri-Stream AVNet (AVNet-Mag).
-    Processes 3 decoupled 3-axis streams (Accelerometer, Gyroscope, Magnetometer)
-    through dedicated 1D dilated convolutional branches, fuses them with a gated
-    convolution, processes temporal dynamics via a 2-layer BiGRU, pools with
-    self-attention, and regresses:
-      1) DDODO: Forward longitudinal speed (1 scalar in m/s)
-      2) DDATT: Relative quaternion imaginary component (3 scalars [qx, qy, qz])
+    Decoupled Multi-Modal Tri-Stream AVNet (AVNet-Mag).
+    Engineered specifically for vehicular dead reckoning:
+      1) Invariant Physical Energy: Automatically augments each stream with its
+         3D Euclidean norm [X, Y, Z, ||V||], guaranteeing rotation-invariant kinetic energy.
+      2) Decoupled Multi-Task Pathways: Separates the Speed branch (specializing on
+         linear acceleration dynamics & vibration PSD) from the Attitude branch
+         (specializing on angular rate integration & magnetometer heading fusion).
+         Eliminates negative task interference / gradient conflict.
+      3) Temporal Endpoint Aggregation: Combines the final recurrent state (h_last)
+         with temporal mean pooling, preserving the cumulative kinematic integration
+         at the window boundary.
+      4) Physically Bounded Speed: Uses a Sigmoid output head strictly bounding
+         normalized speed in [0, 1] (0 to 30 m/s), preventing negative speed oscillations.
     """
     def __init__(self, window_size=20, hidden_dim=64):
         super(TriStreamAVNet, self).__init__()
         self.window_size = window_size
         self.hidden_dim = hidden_dim
 
-        # Stream 1: Accelerometer Branch (Linear Acceleration)
+        # Stream 1: Accelerometer Branch (3 axes + Euclidean Norm = 4 channels)
         self.acc_branch = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=4, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, dilation=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
 
-        # Stream 2: Gyroscope Branch (Angular Velocity)
+        # Stream 2: Gyroscope Branch (3 axes + Euclidean Norm = 4 channels)
         self.gyro_branch = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=4, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, dilation=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
 
-        # Stream 3: Magnetometer Branch (Geomagnetic Flux)
+        # Stream 3: Magnetometer Branch (3 axes + Euclidean Norm = 4 channels)
         self.mag_branch = nn.Sequential(
-            nn.Conv1d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.Conv1d(in_channels=4, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, dilation=2, padding=2),
+            nn.GELU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1)
         )
 
-        # Gated Fusion Block (Concatenates 64 + 64 + 64 = 192 channels)
-        self.fusion_conv = nn.Conv1d(192, 128, kernel_size=1)
-        self.fusion_gate = nn.Conv1d(192, 128, kernel_size=1)
-        self.fusion_bn = nn.BatchNorm1d(128)
-
-        # Bidirectional GRU (128 -> 64 each direction = 128 output)
-        self.bigru = nn.GRU(
-            input_size=128,
+        # Decoupled Task Recurrent Processors:
+        # 1. Speed Recurrent Stream (focuses purely on acceleration dynamics)
+        self.speed_gru = nn.GRU(
+            input_size=64,
             hidden_size=hidden_dim,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
-            dropout=0.2
+            dropout=0.1
         )
 
-        # Temporal Self-Attention Pooling
-        self.attention_pool = SelfAttentionPooling(in_features=hidden_dim * 2)
+        # 2. Attitude Recurrent Stream (fuses Gyro 64 + Mag 64 = 128 channels)
+        self.att_fuse = nn.Sequential(
+            nn.Conv1d(128, 64, kernel_size=1),
+            nn.BatchNorm1d(64),
+            nn.GELU()
+        )
+        self.att_gru = nn.GRU(
+            input_size=64,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.1
+        )
 
-        # Dual Regression Heads
-        # Speed head predicts NORMALIZED speed in [0, 1]. Multiply by SPEED_SCALE (30 m/s) at inference.
+        # Decoupled Regression Heads (each fed by h_last + mean_pool = hidden_dim * 4 = 256 features)
         self.ddodo_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64),
-            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim * 4, 64),
+            nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 1)  # normalized forward speed: 0.0 = stopped, 1.0 = 30 m/s
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Strictly bounded [0, 1] normalized forward speed
         )
 
         self.ddatt_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 3) # relative quaternion [qx, qy, qz]
+            nn.Linear(hidden_dim * 4, 64),
+            nn.GELU(),
+            nn.Linear(64, 3)  # relative quaternion [qx, qy, qz]
         )
 
     def forward(self, acc, gyro, mag=None):
@@ -118,7 +132,7 @@ class TriStreamAVNet(nn.Module):
             gyro: (B, 3, W) or (B, W, 3) - Gyroscope stream
             mag: (B, 3, W) or (B, W, 3) - Magnetometer stream (optional, zeros if None)
         Returns:
-            v_lon: (B, 1) - Predicted forward speed in m/s
+            v_lon: (B, 1) - Predicted forward speed in normalized [0, 1] range
             dq_xyz: (B, 3) - Predicted relative quaternion imaginary part
         """
         if acc.dim() == 3 and acc.size(-1) == 3:
@@ -131,32 +145,36 @@ class TriStreamAVNet(nn.Module):
         elif mag.dim() == 3 and mag.size(-1) == 3:
             mag = mag.transpose(1, 2)
 
-        # Standardize physical sensor scales to [-1, +1] range
+        # Standardize physical sensor scales
         acc_scaled = acc / 9.81
-        gyro_scaled = gyro # rad/s is already order of ~0.1 - 1.0
-        mag_scaled = mag / 50.0 # ~50 uT field scaled to unit order
+        gyro_scaled = gyro
+        mag_scaled = mag / 50.0
 
-        # 1. Decoupled feature extraction
-        f_acc = self.acc_branch(acc_scaled)   # (B, 64, W)
-        f_gyro = self.gyro_branch(gyro_scaled)# (B, 64, W)
-        f_mag = self.mag_branch(mag_scaled)   # (B, 64, W)
+        # Compute rotation-invariant Euclidean norm as 4th channel
+        acc_norm = torch.norm(acc_scaled, p=2, dim=1, keepdim=True)
+        gyro_norm = torch.norm(gyro_scaled, p=2, dim=1, keepdim=True)
+        mag_norm = torch.norm(mag_scaled, p=2, dim=1, keepdim=True)
 
-        # 2. Gated Cross-Sensor Fusion
-        f_cat = torch.cat([f_acc, f_gyro, f_mag], dim=1) # (B, 192, W)
-        fusion = self.fusion_conv(f_cat)
-        gate = torch.sigmoid(self.fusion_gate(f_cat))
-        f_fused = self.fusion_bn(fusion * gate) # (B, 128, W)
+        acc_in = torch.cat([acc_scaled, acc_norm], dim=1)   # (B, 4, W)
+        gyro_in = torch.cat([gyro_scaled, gyro_norm], dim=1) # (B, 4, W)
+        mag_in = torch.cat([mag_scaled, mag_norm], dim=1)   # (B, 4, W)
 
-        # 3. Recurrent Temporal Dynamics
-        f_fused_t = f_fused.transpose(1, 2) # (B, W, 128)
-        gru_out, _ = self.bigru(f_fused_t)  # (B, W, 128)
+        # 1. Feature extraction
+        f_acc = self.acc_branch(acc_in)   # (B, 64, W)
+        f_gyro = self.gyro_branch(gyro_in) # (B, 64, W)
+        f_mag = self.mag_branch(mag_in)   # (B, 64, W)
 
-        # 4. Self-Attention Pooling
-        context, _ = self.attention_pool(gru_out) # (B, 128)
+        # 2. Decoupled Path A: Forward Speed (DDODO)
+        out_spd, _ = self.speed_gru(f_acc.transpose(1, 2))  # (B, W, 128)
+        # Combine final recurrent state (h_last) with temporal mean pool
+        feat_spd = torch.cat([out_spd[:, -1, :], torch.mean(out_spd, dim=1)], dim=-1) # (B, 256)
+        v_lon = self.ddodo_head(feat_spd) # (B, 1) strictly in [0, 1]
 
-        # 5. Regression Heads
-        v_lon = self.ddodo_head(context)   # (B, 1)
-        dq_xyz = self.ddatt_head(context) # (B, 3)
+        # 3. Decoupled Path B: Attitude Change (DDATT)
+        f_rot = self.att_fuse(torch.cat([f_gyro, f_mag], dim=1)) # (B, 64, W)
+        out_att, _ = self.att_gru(f_rot.transpose(1, 2))         # (B, W, 128)
+        feat_att = torch.cat([out_att[:, -1, :], torch.mean(out_att, dim=1)], dim=-1) # (B, 256)
+        dq_xyz = self.ddatt_head(feat_att) # (B, 3)
 
         return v_lon, dq_xyz
 

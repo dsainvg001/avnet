@@ -38,7 +38,7 @@ def compute_attitude_loss(pred_dq_xyz, target_dq_xyz):
     return chordal_loss + 2.0 * mse_loss
 
 
-def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
+def evaluate_model(model, dataloader, lambda_att=3.0, device='cpu'):
     """
     Compute validation metrics: Speed RMSE (m/s) and Attitude Geodesic Error (degrees).
     target_speed in the dataloader is normalized by SPEED_SCALE; we denormalize for RMSE reporting.
@@ -101,7 +101,7 @@ def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
 
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
-                          epochs=15, lr=5e-4, lambda_att=50.0,
+                          epochs=15, lr=8e-4, lambda_att=3.0,
                           weight_decay=3e-4, patience=15,
                           checkpoint_dir='checkpoints', device='cpu'):
     """
