@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+# Speed scale constant: model predicts normalized speed in [0, 1] range.
+# Multiply by SPEED_SCALE to convert predictions back to m/s at inference/eval time.
+SPEED_SCALE = 30.0  # m/s — covers the full IO-VNBD speed range (0–120 km/h = 33 m/s)
+
 class SelfAttentionPooling(nn.Module):
     """
     Temporal Self-Attention Pooling layer.
@@ -92,10 +96,12 @@ class TriStreamAVNet(nn.Module):
         self.attention_pool = SelfAttentionPooling(in_features=hidden_dim * 2)
 
         # Dual Regression Heads
+        # Speed head predicts NORMALIZED speed in [0, 1]. Multiply by SPEED_SCALE (30 m/s) at inference.
         self.ddodo_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 1) # scalar forward speed (v_lon)
+            nn.Dropout(0.2),
+            nn.Linear(64, 1)  # normalized forward speed: 0.0 = stopped, 1.0 = 30 m/s
         )
 
         self.ddatt_head = nn.Sequential(

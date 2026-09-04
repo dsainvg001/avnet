@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import numpy as np
+from avnet.models.avnet import SPEED_SCALE
 
 def compute_attitude_loss(pred_dq_xyz, target_dq_xyz):
     """
@@ -40,6 +41,7 @@ def compute_attitude_loss(pred_dq_xyz, target_dq_xyz):
 def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
     """
     Compute validation metrics: Speed RMSE (m/s) and Attitude Geodesic Error (degrees).
+    target_speed in the dataloader is normalized by SPEED_SCALE; we denormalize for RMSE reporting.
     """
     model.eval()
     total_samples = 0
@@ -52,13 +54,14 @@ def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
             acc = batch['acc'].to(device)
             gyro = batch['gyro'].to(device)
             mag = batch['mag'].to(device)
-            target_speed = batch['target_speed'].to(device)
+            target_speed = batch['target_speed'].to(device)  # normalized [0, 1]
             target_dq = batch['target_delta_q'].to(device)
 
             pred_speed, pred_dq = model(acc, gyro, mag)
-            pred_speed = torch.clamp(pred_speed, min=0.0, max=80.0)
+            # Clamp in normalized [0, 1] space (corresponds to 0–30 m/s)
+            pred_speed = torch.clamp(pred_speed, min=0.0, max=1.0)
 
-            l_speed = F.smooth_l1_loss(pred_speed, target_speed)
+            l_speed = F.smooth_l1_loss(pred_speed, target_speed, beta=0.1)
             l_att = compute_attitude_loss(pred_dq, target_dq)
 
             if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isinf(l_speed) or torch.isinf(l_att):
@@ -68,8 +71,10 @@ def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
             val_loss_sum += loss.item() * acc.size(0)
             total_samples += acc.size(0)
 
-            # Metrics
-            speed_err = (pred_speed - target_speed).cpu().numpy().flatten()
+            # Denormalize speed for human-readable RMSE in m/s
+            pred_mps = (pred_speed * SPEED_SCALE).cpu().numpy().flatten()
+            tgt_mps  = (target_speed * SPEED_SCALE).cpu().numpy().flatten()
+            speed_err = pred_mps - tgt_mps
             valid_speed_err = speed_err[np.isfinite(speed_err)]
             speed_sq_errors.extend(valid_speed_err ** 2)
 
@@ -97,7 +102,7 @@ def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
                           epochs=15, lr=5e-4, lambda_att=50.0,
-                          weight_decay=1e-4, checkpoint_dir='checkpoints',
+                          weight_decay=3e-4, checkpoint_dir='checkpoints',
                           device='cpu'):
     """
     Train TriStreamAVNet with multi-task Huber + Geodesic loss and Cosine Annealing.
@@ -140,9 +145,12 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
 
             pred_speed, pred_dq = model(acc, gyro, mag)
 
-            loss_speed = F.smooth_l1_loss(pred_speed, target_speed)
+            # target_speed is normalized to [0, 1] (SPEED_SCALE = 30 m/s) by the dataset.
+            # Use beta=0.1 SmoothL1 so the quadratic region spans ±3 m/s equivalent.
+            loss_speed = F.smooth_l1_loss(pred_speed, target_speed, beta=0.1)
             loss_att = compute_attitude_loss(pred_dq, target_dq)
             loss_total = loss_speed + lambda_att * loss_att
+
 
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 optimizer.zero_grad()

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy.spatial.transform import Rotation as R
+from avnet.models.avnet import SPEED_SCALE
 
 def latlon_to_enu(lat, lon, alt, lat0=None, lon0=None, alt0=None):
     """
@@ -341,7 +342,8 @@ class TriStreamDataset(Dataset):
                     'acc': torch.tensor(acc_win, dtype=torch.float32),   # (3, W)
                     'gyro': torch.tensor(gyro_win, dtype=torch.float32), # (3, W)
                     'mag': torch.tensor(mag_win, dtype=torch.float32),   # (3, W)
-                    'target_speed': torch.tensor([target_speed], dtype=torch.float32), # (1,)
+                    # Normalize speed to [0, 1] so the model learns a scale-invariant speed signal
+                    'target_speed': torch.tensor([target_speed / SPEED_SCALE], dtype=torch.float32),  # (1,) normalized
                     'target_delta_q': torch.tensor(target_delta_q, dtype=torch.float32), # (3,)
                     'delta_dist': torch.tensor([delta_dist], dtype=torch.float32)
                 })
