@@ -129,13 +129,25 @@ def load_iovnbd_csv(filepath, v_filepath=None):
 
     gt_enu = latlon_to_enu(lat, lon, alt)
 
-    orient_cols = [c for c in df.columns if 'ORIENTATION' in c]
-    if len(orient_cols) >= 3:
-        azimuth = df[orient_cols[0]].astype(float).values
-        pitch = df[orient_cols[1]].astype(float).values
-        roll = df[orient_cols[2]].astype(float).values
+    # Orientation parsing: explicitly select phone IMU orientation, EXCLUDING GPS ORIENTATION
+    orient_yaw = [c for c in df.columns if ('ORIENTATION (Yaw)' in c or 'ORIENTATION (Azimuth)' in c or c == 'ORIENTATION YAW')]
+    orient_pitch = [c for c in df.columns if ('ORIENTATION (Pitch)' in c or c == 'ORIENTATION PITCH')]
+    orient_roll = [c for c in df.columns if ('ORIENTATION (Roll' in c or c == 'ORIENTATION ROLL')]
+
+    if orient_yaw and orient_pitch and orient_roll:
+        azimuth = pd.Series(df[orient_yaw[0]]).ffill().bfill().fillna(0.0).astype(float).values
+        pitch = pd.Series(df[orient_pitch[0]]).ffill().bfill().fillna(0.0).astype(float).values
+        roll = pd.Series(df[orient_roll[0]]).ffill().bfill().fillna(0.0).astype(float).values
+
         rotations = R.from_euler('zyx', np.stack([azimuth, pitch, roll], axis=-1), degrees=True)
         gt_quat = rotations.as_quat() # [x, y, z, w]
+
+        # Guard against any zero or NaN norm quaternions
+        norms = np.linalg.norm(gt_quat, axis=-1, keepdims=True)
+        invalid = np.isnan(norms) | (norms < 1e-6)
+        gt_quat[invalid.squeeze()] = [0.0, 0.0, 0.0, 1.0]
+        norms[invalid] = 1.0
+        gt_quat = gt_quat / norms
     else:
         gt_quat = np.tile([0.0, 0.0, 0.0, 1.0], (len(df), 1))
 
@@ -218,8 +230,15 @@ class TriStreamDataset(Dataset):
                 target_speed = speed[end_idx]
 
                 # Compute relative quaternion delta: q_rel = q_start^-1 * q_end
-                q_start = R.from_quat(quat[start_idx])
-                q_end = R.from_quat(quat[end_idx])
+                q_s = quat[start_idx]
+                q_e = quat[end_idx]
+                norm_s = np.linalg.norm(q_s)
+                norm_e = np.linalg.norm(q_e)
+                if norm_s < 1e-6 or norm_e < 1e-6 or np.isnan(norm_s) or np.isnan(norm_e):
+                    continue
+
+                q_start = R.from_quat(q_s / norm_s)
+                q_end = R.from_quat(q_e / norm_e)
                 q_rel = q_start.inv() * q_end
                 q_rel_vec = q_rel.as_quat() # [x, y, z, w]
 
