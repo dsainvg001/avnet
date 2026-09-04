@@ -37,7 +37,7 @@ def compute_attitude_loss(pred_dq_xyz, target_dq_xyz):
     return chordal_loss + 2.0 * mse_loss
 
 
-def evaluate_model(model, dataloader, device='cpu'):
+def evaluate_model(model, dataloader, lambda_att=50.0, device='cpu'):
     """
     Compute validation metrics: Speed RMSE (m/s) and Attitude Geodesic Error (degrees).
     """
@@ -64,7 +64,7 @@ def evaluate_model(model, dataloader, device='cpu'):
             if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isinf(l_speed) or torch.isinf(l_att):
                 continue
 
-            loss = l_speed + 50.0 * l_att
+            loss = l_speed + lambda_att * l_att
             val_loss_sum += loss.item() * acc.size(0)
             total_samples += acc.size(0)
 
@@ -167,7 +167,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
 
         # Validation
         if val_loader is not None and len(val_loader) > 0:
-            val_metrics = evaluate_model(model, val_loader, device=device)
+            val_metrics = evaluate_model(model, val_loader, lambda_att=lambda_att, device=device)
             val_loss = val_metrics['val_loss']
             speed_rmse = val_metrics['speed_rmse_mps']
             att_deg = val_metrics['att_error_deg']

@@ -1,5 +1,6 @@
 import os
 import glob
+import random
 import pandas as pd
 import numpy as np
 import torch
@@ -392,14 +393,22 @@ class AVNetDataset(Dataset):
 
 
 def create_dataloaders(root_dir='data', window_size=20, step=2, batch_size=64,
-                       train_ratio=0.8, val_ratio=0.1, limit_files=None, num_workers=0):
+                       train_ratio=0.8, val_ratio=0.1, limit_files=None, num_workers=0, seed=42):
     """
     High-level factory function: discovers paired files, loads and windowizes them,
     and returns (train_loader, val_loader, test_loader).
+    Uses deterministic pseudo-random shuffling (seed=42) to ensure balanced driver,
+    vehicle, and speed distributions across Train, Val, and Test splits.
     """
     pairs = discover_paired_iovnbd_files(root_dir)
     if not pairs:
         raise FileNotFoundError(f"No IO-VNBD dataset files found in {root_dir}")
+
+    # Deterministic shuffle to balance driver, vehicle, and route distributions across splits
+    if seed is not None:
+        rng = random.Random(seed)
+        pairs = pairs.copy()
+        rng.shuffle(pairs)
 
     if limit_files is not None and limit_files > 0:
         pairs = pairs[:limit_files]
