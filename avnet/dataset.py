@@ -90,19 +90,24 @@ def load_iovnbd_csv(filepath, v_filepath=None):
     gyro = np.nan_to_num(gyro, nan=0.0)
     mag = np.nan_to_num(mag, nan=0.0)
 
-    # Auto-detect matching vehicle CAN file if not provided
+    # Auto-detect matching vehicle CAN file if not provided (case-insensitive for Linux/Kaggle)
     if v_filepath is None:
         dir_name = os.path.dirname(filepath)
         base_name = os.path.basename(filepath)
-        if base_name.startswith('S-'):
-            candidate_v = os.path.join(dir_name, 'V-' + base_name[2:])
-            if os.path.exists(candidate_v):
-                v_filepath = candidate_v
-            else:
-                # Check sibling directory if in S-Dataset
-                candidate_v_alt = os.path.join(dir_name.replace('S-Dataset', 'V-Dataset').replace('S Dataset', 'V Dataset'), 'V-' + base_name[2:])
-                if os.path.exists(candidate_v_alt):
-                    v_filepath = candidate_v_alt
+        session_key = base_name[2:].lower()
+        if os.path.exists(dir_name):
+            for f in os.listdir(dir_name):
+                if f.lower().startswith('v-') and f[2:].lower() == session_key:
+                    v_filepath = os.path.join(dir_name, f)
+                    break
+        if v_filepath is None:
+            # Check sibling directory if in S-Dataset
+            alt_dir = dir_name.replace('S-Dataset', 'V-Dataset').replace('S Dataset', 'V Dataset')
+            if os.path.exists(alt_dir):
+                for f in os.listdir(alt_dir):
+                    if f.lower().startswith('v-') and f[2:].lower() == session_key:
+                        v_filepath = os.path.join(alt_dir, f)
+                        break
 
     has_vehicle_can = False
     speed_kmh = None
@@ -201,47 +206,67 @@ def load_iovnbd_csv(filepath, v_filepath=None):
 def discover_paired_iovnbd_files(root_dir='data'):
     """
     Search root_dir for all synchronized (S-*.csv, V-*.csv) file pairs.
-    Automatically matches sibling directories (e.g. S-Dataset <-> V-Dataset)
-    and deduplicates by session name so there is no data leakage across splits.
+    Uses case-insensitive session key indexing and os.walk to guarantee 100% pairing
+    on Linux (case-sensitive) filesystems like Kaggle / Google Colab.
+    Deduplicates by session name so there is no data leakage across splits.
     Returns list of (s_path, v_path) tuples.
     """
-    raw_pairs = []
-    # Search in Synchronised directory first
-    sync_dir = os.path.join(root_dir, 'Synchronised V abd S datasets')
-    search_path = sync_dir if os.path.exists(sync_dir) else root_dir
+    sync_candidates = [
+        os.path.join(root_dir, 'Synchronised V abd S datasets'),
+        os.path.join(root_dir, 'Synchronised V and S datasets'),
+        root_dir
+    ]
+    search_path = next((p for p in sync_candidates if os.path.exists(p)), root_dir)
 
-    s_files = glob.glob(os.path.join(search_path, '**', 'S-*.csv'), recursive=True)
-    for s_path in s_files:
-        dir_name = os.path.dirname(s_path)
-        base_name = os.path.basename(s_path)
-        v_name = 'V-' + base_name[2:]
-        v_path = os.path.join(dir_name, v_name)
-        if os.path.exists(v_path):
-            raw_pairs.append((s_path, v_path))
-        else:
-            # Check sibling directory if in S-Dataset
-            v_alt = os.path.join(dir_name.replace('S-Dataset', 'V-Dataset').replace('S Dataset', 'V Dataset'), v_name)
-            if os.path.exists(v_alt):
-                raw_pairs.append((s_path, v_alt))
-            else:
-                raw_pairs.append((s_path, None))
+    def is_categorised(p):
+        pl = p.lower()
+        return 'categorised' in pl and 'uncategorised' not in pl
 
-    # Deduplicate by session basename (e.g. S-M.csv, S-Y1.csv)
-    # Prefer pairs that have a valid v_path, and prefer 'Categorised' over 'Uncategorised'
-    unique_pairs = {}
-    for s_path, v_path in raw_pairs:
-        base = os.path.basename(s_path)
-        if base not in unique_pairs:
-            unique_pairs[base] = (s_path, v_path)
-        else:
-            # If current stored pair has no v_path but this one does, replace it
-            if unique_pairs[base][1] is None and v_path is not None:
-                unique_pairs[base] = (s_path, v_path)
-            # If both have v_path, prefer 'Categorised'
-            elif 'Categorised' in s_path:
-                unique_pairs[base] = (s_path, v_path)
+    # 1. Index all V-files by lowercase session key (e.g. 'vtb6.csv', 'm.csv')
+    v_map = {}
+    for r, dirs, files in os.walk(search_path):
+        for f in files:
+            fl = f.lower()
+            if fl.startswith('v-') and fl.endswith('.csv'):
+                key = fl[2:]
+                full_path = os.path.join(r, f)
+                if key not in v_map or (is_categorised(full_path) and not is_categorised(v_map[key])):
+                    v_map[key] = full_path
 
-    return list(unique_pairs.values())
+    # Fallback search across full root_dir if search_path was a subfolder
+    if search_path != root_dir and os.path.exists(root_dir):
+        for r, dirs, files in os.walk(root_dir):
+            for f in files:
+                fl = f.lower()
+                if fl.startswith('v-') and fl.endswith('.csv'):
+                    key = fl[2:]
+                    if key not in v_map:
+                        v_map[key] = os.path.join(r, f)
+
+    # 2. Index all S-files by lowercase session key
+    s_map = {}
+    for r, dirs, files in os.walk(search_path):
+        for f in files:
+            fl = f.lower()
+            if fl.startswith('s-') and fl.endswith('.csv'):
+                key = fl[2:]
+                full_path = os.path.join(r, f)
+                if key not in s_map or (is_categorised(full_path) and not is_categorised(s_map[key])):
+                    s_map[key] = full_path
+
+    pairs = []
+    for k in sorted(s_map.keys()):
+        s_p = s_map[k]
+        v_p = v_map.get(k, None)
+        pairs.append((s_p, v_p))
+
+    # Prefer pairs that have vehicle CAN ground truth
+    valid_pairs = [p for p in pairs if p[1] is not None]
+    if valid_pairs:
+        pairs = valid_pairs
+
+    return pairs
+
 
 
 class TriStreamDataset(Dataset):
