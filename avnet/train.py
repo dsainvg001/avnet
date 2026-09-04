@@ -55,12 +55,11 @@ def evaluate_model(model, dataloader, lambda_att=3.0, lambda_zupt=2.0, device='c
         for batch in dataloader:
             acc = batch['acc'].to(device)
             gyro = batch['gyro'].to(device)
-            mag = batch['mag'].to(device)
             target_speed = batch['target_speed'].to(device)  # normalized [0, 1]
             target_dq = batch['target_delta_q'].to(device)
             target_stop = batch.get('target_is_stopped', (target_speed < 0.3 / SPEED_SCALE).float()).to(device)
 
-            pred_speed, pred_dq, pred_stop = model(acc, gyro, mag, return_zupt=True)
+            pred_speed, pred_dq, pred_stop = model(acc, gyro, return_zupt=True)
             # Clamp in normalized [0, 1] space (corresponds to 0–30 m/s)
             pred_speed = torch.clamp(pred_speed, min=0.0, max=1.0)
             pred_stop = torch.clamp(pred_stop, min=1e-7, max=1.0 - 1e-7)
@@ -152,14 +151,13 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
         for step, batch in enumerate(train_loader):
             acc = batch['acc'].to(device)
             gyro = batch['gyro'].to(device)
-            mag = batch['mag'].to(device)
             target_speed = batch['target_speed'].to(device)
             target_dq = batch['target_delta_q'].to(device)
             target_stop = batch.get('target_is_stopped', (target_speed < 0.3 / SPEED_SCALE).float()).to(device)
 
             optimizer.zero_grad()
 
-            pred_speed, pred_dq, pred_stop = model(acc, gyro, mag, return_zupt=True)
+            pred_speed, pred_dq, pred_stop = model(acc, gyro, return_zupt=True)
 
             # target_speed is normalized to [0, 1] (SPEED_SCALE = 30 m/s) by the dataset.
             loss_speed = F.smooth_l1_loss(pred_speed, target_speed, beta=0.1)
@@ -225,7 +223,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
                     'speed_rmse': speed_rmse,
                     'att_deg': att_deg,
                     'zupt_acc': zupt_acc,
-                    'model_config': {'window_size': model.window_size, 'hidden_dim': model.hidden_dim}
+                    'model_config': {'window_size': getattr(model, 'window_size', 20), 'hidden_dim': getattr(model, 'hidden_dim', 64)}
                 }
                 torch.save(checkpoint_data, best_pth)
                 with open(best_pkl, 'wb') as f:
@@ -246,7 +244,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
         'epoch': epochs,
         'model_state_dict': model.state_dict(),
         'history': history,
-        'model_config': {'window_size': model.window_size, 'hidden_dim': model.hidden_dim}
+        'model_config': {'window_size': getattr(model, 'window_size', 20), 'hidden_dim': getattr(model, 'hidden_dim', 64)}
     }
     torch.save(last_data, last_pth)
     with open(last_pkl, 'wb') as f:

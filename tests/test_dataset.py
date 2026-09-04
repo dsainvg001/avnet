@@ -6,7 +6,9 @@ from avnet.dataset import (
     AVNetDataset,
     TriStreamDataset,
     discover_paired_iovnbd_files,
-    latlon_to_enu
+    latlon_to_enu,
+    resample_to_frequency,
+    synthesize_vehicle_vibrations
 )
 
 class TestDataset(unittest.TestCase):
@@ -26,7 +28,6 @@ class TestDataset(unittest.TestCase):
             'dt': np.ones(100) * 0.1,
             'acc': np.random.randn(100, 3).astype(np.float32),
             'gyro': np.random.randn(100, 3).astype(np.float32),
-            'mag': np.random.randn(100, 3).astype(np.float32),
             'gt_speed': (np.random.rand(100) * 10).astype(np.float32),
             'gt_distance_m': (np.cumsum(np.random.rand(100)) * 0.1).astype(np.float32),
             'gt_enu': np.random.randn(100, 3),
@@ -37,9 +38,34 @@ class TestDataset(unittest.TestCase):
         sample = dataset[0]
         self.assertEqual(sample['acc'].shape, (3, 20))
         self.assertEqual(sample['gyro'].shape, (3, 20))
-        self.assertEqual(sample['mag'].shape, (3, 20))
         self.assertEqual(sample['target_speed'].shape, (1,))
         self.assertEqual(sample['target_delta_q'].shape, (3,))
+
+    def test_high_frequency_resampling(self):
+        t = np.arange(50) * 0.1
+        dummy_data = {
+            'time_s': t,
+            'dt': np.ones(50) * 0.1,
+            'acc': np.random.randn(50, 3).astype(np.float32),
+            'gyro': np.random.randn(50, 3).astype(np.float32),
+            'gt_speed': (np.ones(50) * 15.0).astype(np.float32),
+            'gt_distance_m': (np.arange(50) * 1.5).astype(np.float32),
+            'gt_enu': np.zeros((50, 3), dtype=np.float32),
+            'gt_quat': np.tile([0.0, 0.0, 0.0, 1.0], (50, 1)).astype(np.float32)
+        }
+
+        # Resample to 100 Hz
+        resampled_list = resample_to_frequency(dummy_data, target_freq=100.0, synthesize_harmonics=True)
+        self.assertIsInstance(resampled_list, list)
+        self.assertGreater(len(resampled_list), 0)
+        res = resampled_list[0]
+        self.assertAlmostEqual(res['dt'][0], 0.01, places=3)
+        self.assertGreater(len(res['time_s']), 400)
+
+        # Vibration check: speed=15 m/s -> vibrations injected
+        va, vg = synthesize_vehicle_vibrations(t, dummy_data['gt_speed'], sample_rate=100.0)
+        self.assertEqual(va.shape, (50, 3))
+        self.assertGreater(np.std(va), 0.0)
 
     def test_discover_paired_iovnbd_files(self):
         pairs = discover_paired_iovnbd_files('data')

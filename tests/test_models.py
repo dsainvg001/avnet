@@ -1,33 +1,42 @@
 import unittest
 import torch
-from avnet.models.avnet import TriStreamAVNet, AdapterNet9Axis, AVNet, AdapterNet
+from avnet.models.avnet import DualStreamAVNet, TriStreamAVNet, AdapterNet, AVNet, AVNetPaper200
 
 class TestModels(unittest.TestCase):
-    def test_tristream_avnet_forward(self):
-        model = TriStreamAVNet(window_size=20, hidden_dim=64)
+    def test_dualstream_avnet_forward(self):
+        model = DualStreamAVNet(window_size=20, hidden_dim=64)
         acc = torch.randn(4, 3, 20)
         gyro = torch.randn(4, 3, 20)
-        mag = torch.randn(4, 3, 20)
 
-        v_lon, dq = model(acc, gyro, mag)
+        v_lon, dq = model(acc, gyro)
         self.assertEqual(v_lon.shape, (4, 1))
         self.assertEqual(dq.shape, (4, 3))
 
-    def test_tristream_avnet_forward_with_zupt(self):
-        model = TriStreamAVNet(window_size=20, hidden_dim=64)
+    def test_dualstream_avnet_forward_with_zupt(self):
+        model = DualStreamAVNet(window_size=20, hidden_dim=64)
         acc = torch.randn(4, 3, 20)
         gyro = torch.randn(4, 3, 20)
-        mag = torch.randn(4, 3, 20)
 
-        v_lon, dq, p_stop = model(acc, gyro, mag, return_zupt=True)
+        v_lon, dq, p_stop = model(acc, gyro, return_zupt=True)
         self.assertEqual(v_lon.shape, (4, 1))
         self.assertEqual(dq.shape, (4, 3))
         self.assertEqual(p_stop.shape, (4, 1))
         self.assertTrue(torch.all(p_stop >= 0.0) and torch.all(p_stop <= 1.0))
 
-    def test_adapter_9axis_forward(self):
-        model = AdapterNet9Axis(in_channels=9, out_dim=6)
-        x = torch.randn(4, 9, 20)
+    def test_avnet_paper200_forward(self):
+        model = AVNetPaper200(in_channels=6)
+        acc = torch.randn(4, 3, 200)
+        gyro = torch.randn(4, 3, 200)
+
+        v_lon, dq, p_stop = model(acc, gyro, return_zupt=True)
+        self.assertEqual(v_lon.shape, (4, 1))
+        self.assertEqual(dq.shape, (4, 3))
+        self.assertEqual(p_stop.shape, (4, 1))
+        self.assertTrue(torch.all(p_stop >= 0.0) and torch.all(p_stop <= 1.0))
+
+    def test_adapter_6axis_forward(self):
+        model = AdapterNet(in_channels=6, out_dim=6)
+        x = torch.randn(4, 6, 20)
         out = model(x)
         self.assertEqual(out.shape, (4, 6))
 

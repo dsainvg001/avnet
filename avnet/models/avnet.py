@@ -29,24 +29,27 @@ class SelfAttentionPooling(nn.Module):
         return context, weights
 
 
-class TriStreamAVNet(nn.Module):
+class DualStreamAVNet(nn.Module):
     """
-    Decoupled Multi-Modal Tri-Stream AVNet (AVNet-Mag).
-    Engineered specifically for vehicular dead reckoning:
-      1) Invariant Physical Energy: Automatically augments each stream with its
+    Decoupled Multi-Modal Dual-Stream AVNet (6-Axis Pure IMU: Accel + Gyro).
+    Engineered specifically for vehicular dead reckoning WITHOUT magnetometer:
+      1) Elimination of Magnetic Distortions: Smartphone magnetometers inside vehicle cabins
+         suffer extreme, non-stationary hard/soft iron distortions from chassis steel, audio
+         speakers, and EV/alternator high-current lines. Removing magnetometer completely
+         prevents catastrophic heading corruption.
+      2) Invariant Physical Energy: Automatically augments each stream with its
          3D Euclidean norm [X, Y, Z, ||V||], guaranteeing rotation-invariant kinetic energy.
-      2) Decoupled Multi-Task Pathways: Separates the Speed branch (specializing on
+      3) Decoupled Multi-Task Pathways: Separates the Speed branch (specializing on
          linear acceleration dynamics & vibration PSD) from the Attitude branch
-         (specializing on angular rate integration & magnetometer heading fusion).
-         Eliminates negative task interference / gradient conflict.
-      3) Temporal Endpoint Aggregation: Combines the final recurrent state (h_last)
+         (specializing on angular rate integration). Eliminates negative task interference.
+      4) Temporal Endpoint Aggregation: Combines the final recurrent state (h_last)
          with temporal mean pooling, preserving the cumulative kinematic integration
          at the window boundary.
-      4) Physically Bounded Speed: Uses a Sigmoid output head strictly bounding
+      5) Physically Bounded Speed: Uses a Sigmoid output head strictly bounding
          normalized speed in [0, 1] (0 to 30 m/s), preventing negative speed oscillations.
     """
     def __init__(self, window_size=20, hidden_dim=64):
-        super(TriStreamAVNet, self).__init__()
+        super(DualStreamAVNet, self).__init__()
         self.window_size = window_size
         self.hidden_dim = hidden_dim
 
@@ -72,17 +75,6 @@ class TriStreamAVNet(nn.Module):
             nn.Dropout(0.1)
         )
 
-        # Stream 3: Magnetometer Branch (3 axes + Euclidean Norm = 4 channels)
-        self.mag_branch = nn.Sequential(
-            nn.Conv1d(in_channels=4, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.GELU(),
-            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
-
         # Decoupled Task Recurrent Processors:
         # 1. Speed Recurrent Stream (focuses purely on acceleration dynamics)
         self.speed_gru = nn.GRU(
@@ -94,12 +86,7 @@ class TriStreamAVNet(nn.Module):
             dropout=0.1
         )
 
-        # 2. Attitude Recurrent Stream (fuses Gyro 64 + Mag 64 = 128 channels)
-        self.att_fuse = nn.Sequential(
-            nn.Conv1d(128, 64, kernel_size=1),
-            nn.BatchNorm1d(64),
-            nn.GELU()
-        )
+        # 2. Attitude Recurrent Stream (focuses purely on gyroscope rotation dynamics)
         self.att_gru = nn.GRU(
             input_size=64,
             hidden_size=hidden_dim,
@@ -135,11 +122,11 @@ class TriStreamAVNet(nn.Module):
 
     def forward(self, acc, gyro, mag=None, return_zupt=False):
         """
-        Forward pass.
+        Forward pass (6-axis IMU only, magnetometer is ignored).
         Args:
             acc: (B, 3, W) or (B, W, 3) - Accelerometer stream
             gyro: (B, 3, W) or (B, W, 3) - Gyroscope stream
-            mag: (B, 3, W) or (B, W, 3) - Magnetometer stream (optional, zeros if None)
+            mag: Ignored (retained for backward signature compatibility)
             return_zupt: bool - If True, returns (v_lon, dq_xyz, p_stop); if False, returns (v_lon, dq_xyz)
         Returns:
             v_lon: (B, 1) - Predicted forward speed in normalized [0, 1] range
@@ -151,40 +138,29 @@ class TriStreamAVNet(nn.Module):
         if gyro.dim() == 3 and gyro.size(-1) == 3:
             gyro = gyro.transpose(1, 2)
 
-        if mag is None:
-            mag = torch.zeros_like(acc)
-        elif mag.dim() == 3 and mag.size(-1) == 3:
-            mag = mag.transpose(1, 2)
-
         # Standardize physical sensor scales
         acc_scaled = acc / 9.81
         gyro_scaled = gyro
-        mag_scaled = mag / 50.0
 
         # Compute rotation-invariant Euclidean norm as 4th channel
         acc_norm = torch.norm(acc_scaled, p=2, dim=1, keepdim=True)
         gyro_norm = torch.norm(gyro_scaled, p=2, dim=1, keepdim=True)
-        mag_norm = torch.norm(mag_scaled, p=2, dim=1, keepdim=True)
 
         acc_in = torch.cat([acc_scaled, acc_norm], dim=1)   # (B, 4, W)
         gyro_in = torch.cat([gyro_scaled, gyro_norm], dim=1) # (B, 4, W)
-        mag_in = torch.cat([mag_scaled, mag_norm], dim=1)   # (B, 4, W)
 
         # 1. Feature extraction
-        f_acc = self.acc_branch(acc_in)   # (B, 64, W)
+        f_acc = self.acc_branch(acc_in)    # (B, 64, W)
         f_gyro = self.gyro_branch(gyro_in) # (B, 64, W)
-        f_mag = self.mag_branch(mag_in)   # (B, 64, W)
 
         # 2. Decoupled Path A: Forward Speed (DDODO) & Stationary Detection (DDZUPT)
         out_spd, _ = self.speed_gru(f_acc.transpose(1, 2))  # (B, W, 128)
-        # Combine final recurrent state (h_last) with temporal mean pool
         feat_spd = torch.cat([out_spd[:, -1, :], torch.mean(out_spd, dim=1)], dim=-1) # (B, 256)
         v_lon = self.ddodo_head(feat_spd)  # (B, 1) strictly in [0, 1]
         p_stop = self.zupt_head(feat_spd)  # (B, 1) stationary probability in [0, 1]
 
         # 3. Decoupled Path B: Attitude Change (DDATT)
-        f_rot = self.att_fuse(torch.cat([f_gyro, f_mag], dim=1)) # (B, 64, W)
-        out_att, _ = self.att_gru(f_rot.transpose(1, 2))         # (B, W, 128)
+        out_att, _ = self.att_gru(f_gyro.transpose(1, 2))         # (B, W, 128)
         feat_att = torch.cat([out_att[:, -1, :], torch.mean(out_att, dim=1)], dim=-1) # (B, 256)
         dq_xyz = self.ddatt_head(feat_att) # (B, 3)
 
@@ -193,14 +169,18 @@ class TriStreamAVNet(nn.Module):
         return v_lon, dq_xyz
 
 
-class AdapterNet9Axis(nn.Module):
+# Alias for backwards compatibility
+TriStreamAVNet = DualStreamAVNet
+
+
+class AdapterNet(nn.Module):
     """
-    Multi-Modal 9-Axis Filter Parameter Adapter Network (2-layer 1D dilated CNN).
-    Takes 9-channel IMU (accel + gyro + mag) window and outputs 6 scaling parameters
-    (3 for process noise Q, 3 for measurement noise N) bounded by tanh.
+    6-Axis Filter Parameter Adapter Network (2-layer 1D dilated CNN).
+    Takes 6-channel IMU (accel + gyro) window as in Qian et al. (2025) Section 2.2
+    and outputs 6 scaling parameters (3 for process noise Q, 3 for measurement noise N) bounded by tanh.
     """
-    def __init__(self, in_channels=9, out_dim=6):
-        super(AdapterNet9Axis, self).__init__()
+    def __init__(self, in_channels=6, out_dim=6):
+        super(AdapterNet, self).__init__()
         self.in_channels = in_channels
         self.conv1 = nn.Conv1d(in_channels, 32, kernel_size=5, dilation=1, padding=2)
         self.dropout1 = nn.Dropout(0.2)
@@ -237,6 +217,10 @@ class AdapterNet9Axis(nn.Module):
         return q_scale, n_scale
 
 
+# Alias for backwards compatibility
+AdapterNet9Axis = AdapterNet
+
+
 # Legacy aliases for backward compatibility
 class AVNet(nn.Module):
     def __init__(self, in_channels=6, out_dim=1, hidden_dim=64):
@@ -266,6 +250,70 @@ class AVNet(nn.Module):
         out_last = out_gru[:, -1, :]
         return self.regressor(out_last)
 
-class AdapterNet(AdapterNet9Axis):
-    def __init__(self, in_channels=6, out_dim=6):
-        super(AdapterNet, self).__init__(in_channels=in_channels, out_dim=out_dim)
+
+class AVNetPaper200(nn.Module):
+    """
+    Exact deep CNN-GRU network architecture from Qian et al. (2025):
+    'Avnet: learning attitude and velocity for vehicular dead reckoning using smartphone by adapting an invariant EKF'
+    Uses pure 6-axis IMU (3-axis Gyro + 3-axis Accel) without magnetometer.
+    Designed for W=200 sample windows (1.0 s at 200 Hz or 2.0 s at 100 Hz).
+    Layer specifications:
+      1. Conv1d(6, 128, kernel_size=11, stride=1, padding=0) + ReLU + MaxPool1d(2, 2) -> (B, 128, 95)
+      2. Conv1d(128, 256, kernel_size=9, stride=1, padding=0) + ReLU + MaxPool1d(2, 2) -> (B, 256, 43)
+      3. Flatten -> (B, 11008)
+      4. Linear(11008, 1024) + ReLU + Linear(1024, 512) + ReLU -> (B, 512)
+      5. GRU(input_size=512, hidden_size=64, num_layers=2, batch_first=True) -> (B, 1, 64)
+      6. Regression heads: DDODO (speed), DDATT (quaternion xyz), DDZUPT (standstill).
+    """
+    def __init__(self, in_channels=6):
+        super(AVNetPaper200, self).__init__()
+        self.in_channels = in_channels
+        self.window_size = 200
+        self.hidden_dim = 64
+        self.conv1 = nn.Conv1d(in_channels, 128, kernel_size=11, stride=1, padding=0)
+        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
+
+        self.conv2 = nn.Conv1d(128, 256, kernel_size=9, stride=1, padding=0)
+        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+
+        self.fc1 = nn.Linear(256 * 43, 1024)
+        self.fc2 = nn.Linear(1024, 512)
+
+        self.gru = nn.GRU(input_size=512, hidden_size=64, num_layers=2, batch_first=True)
+
+        self.ddodo_head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Normalized forward speed [0, 1]
+        )
+        self.ddatt_head = nn.Linear(64, 3)
+        self.zupt_head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Standstill probability [0, 1]
+        )
+
+    def forward(self, acc, gyro, mag=None, return_zupt=False):
+        if acc.dim() == 3 and acc.size(-1) == 3:
+            acc = acc.transpose(1, 2)
+        if gyro.dim() == 3 and gyro.size(-1) == 3:
+            gyro = gyro.transpose(1, 2)
+
+        # 6-channel IMU (gyro + acc) exactly as in Section 2.1 of the paper (no magnetometer)
+        x = torch.cat([gyro, acc], dim=1)  # (B, 6, 200)
+
+        out = self.pool1(F.relu(self.conv1(x)))
+        out = self.pool2(F.relu(self.conv2(out)))
+        out = out.flatten(1)  # (B, 11008)
+
+        feat = F.relu(self.fc1(out))
+        feat = F.relu(self.fc2(feat)).unsqueeze(1)  # (B, 1, 512)
+
+        gru_out, _ = self.gru(feat)
+        h_last = gru_out[:, -1, :]  # (B, 64)
+
+        v_lon = self.ddodo_head(h_last)
+        dq_xyz = self.ddatt_head(h_last)
+        p_stop = self.zupt_head(h_last)
+
+        if return_zupt:
+            return v_lon, dq_xyz, p_stop
+        return v_lon, dq_xyz

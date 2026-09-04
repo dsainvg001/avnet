@@ -36,7 +36,6 @@ class TestPipeline(unittest.TestCase):
             'dt': np.ones(100) * 0.1,
             'acc': np.random.randn(100, 3).astype(np.float32),
             'gyro': np.random.randn(100, 3).astype(np.float32),
-            'mag': np.random.randn(100, 3).astype(np.float32),
             'gt_speed': (np.random.rand(100) * 10).astype(np.float32),
             'gt_distance_m': (np.cumsum(np.random.rand(100)) * 0.1).astype(np.float32),
             'gt_enu': np.random.randn(100, 3),

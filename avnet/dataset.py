@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
+from scipy.interpolate import PchipInterpolator
 from avnet.models.avnet import SPEED_SCALE
 
 def latlon_to_enu(lat, lon, alt, lat0=None, lon0=None, alt0=None):
@@ -270,13 +271,173 @@ def discover_paired_iovnbd_files(root_dir='data'):
     return pairs
 
 
+def slice_sequence(data, start, end):
+    """
+    Slice all synchronized array streams within a driving data dictionary.
+    """
+    n_total = len(data['time_s'])
+    sliced = {}
+    for k, v in data.items():
+        if isinstance(v, np.ndarray) and len(v) == n_total:
+            sliced[k] = v[start:end]
+        else:
+            sliced[k] = v
+    return sliced
+
+
+def split_continuous_segments(data, max_gap_s=2.0):
+    """
+    Partition driving data into strictly continuous segments where time is monotonically increasing.
+    Splits at any session restarts (dt <= 0) or large communication pauses (dt > max_gap_s).
+    """
+    t = data['time_s']
+    if len(t) < 20:
+        return [data]
+
+    dt = np.diff(t)
+    break_indices = np.where((dt <= 0) | (dt > max_gap_s))[0] + 1
+    segments = []
+    start = 0
+    for b in break_indices:
+        if b - start >= 20:
+            segments.append(slice_sequence(data, start, b))
+        start = b
+    if len(t) - start >= 20:
+        segments.append(slice_sequence(data, start, len(t)))
+    return segments if segments else [data]
+
+
+def synthesize_vehicle_vibrations(t, speed_ms, sample_rate=100.0):
+    """
+    Physics-informed quarter-car & powertrain harmonic synthesis.
+    Generates speed-dependent road roughness and rotational vibrations:
+      - Wheel rotation harmonics: f_wheel = speed_ms / (2 * pi * R_wheel)
+      - Engine RPM harmonics: f_engine ~ 25 + 2 * speed_ms Hz
+      - Road roughness excitation: wideband colored noise scaling with sqrt(v)
+      - At standstill (v < 0.3 m/s), vibrations decay to zero.
+    """
+    N = len(t)
+    vib_acc = np.zeros((N, 3), dtype=np.float32)
+    vib_gyro = np.zeros((N, 3), dtype=np.float32)
+
+    # Wheel radius ~ 0.32m -> circumference ~ 2.01m
+    f_wheel = speed_ms / 2.01  # Hz
+    # Engine RPM approx: idle 800 RPM (26 Hz) to 2500 RPM (83 Hz)
+    f_engine = np.clip(25.0 + 2.0 * speed_ms, 25.0, sample_rate / 2.2)
+
+    dt = 1.0 / sample_rate
+    phase_wheel = 2.0 * np.pi * np.cumsum(f_wheel * dt)
+    phase_eng = 2.0 * np.pi * np.cumsum(f_engine * dt)
+
+    # Amplitude scales with speed
+    speed_factor = np.clip(speed_ms / 15.0, 0.0, 2.5)  # Normalized scale
+    moving = (speed_ms > 0.3).astype(np.float32)[:, None]
+
+    # 1. Wheel rotational vibration (primarily vertical Z and forward X)
+    vib_acc[:, 0] += (0.05 * speed_factor * np.sin(phase_wheel)).astype(np.float32)
+    vib_acc[:, 2] += (0.10 * speed_factor * np.sin(phase_wheel)).astype(np.float32)
+
+    # 2. Engine vibration (all 3 axes)
+    vib_acc[:, 0] += (0.03 * speed_factor * np.sin(phase_eng)).astype(np.float32)
+    vib_acc[:, 1] += (0.03 * speed_factor * np.sin(phase_eng + 1.0)).astype(np.float32)
+    vib_acc[:, 2] += (0.05 * speed_factor * np.sin(phase_eng + 2.0)).astype(np.float32)
+
+    # 3. Wideband road surface roughness (colored noise modulated by speed)
+    road_noise = np.random.randn(N, 3).astype(np.float32) * (0.08 * np.sqrt(speed_factor[:, None] + 1e-4))
+    vib_acc += road_noise * moving
+
+    # Gyro micro-vibrations
+    vib_gyro += (np.random.randn(N, 3).astype(np.float32) * 0.005 * speed_factor[:, None]) * moving
+
+    return vib_acc, vib_gyro
+
+
+def resample_to_frequency(data, target_freq=100.0, synthesize_harmonics=True):
+    """
+    Continuous-Time High-Frequency Extrapolation & Resampling.
+    Upsamples discrete sensor observations to target high frequency (e.g. 100 Hz or 200 Hz).
+    Splits across session resets, interpolates each segment with PCHIP and Slerp,
+    and optionally synthesizes physical road/powertrain vibrations.
+    """
+    segments = split_continuous_segments(data, max_gap_s=2.0)
+    resampled_segments = []
+    step = 1.0 / target_freq
+
+    for seg in segments:
+        t = seg['time_s']
+        if len(t) < 10 or t[-1] - t[0] < step * 10:
+            continue
+
+        # Ensure strict monotonicity within segment
+        keep = [0]
+        last_t = t[0]
+        for i in range(1, len(t)):
+            if t[i] > last_t + 1e-4:
+                keep.append(i)
+                last_t = t[i]
+        keep = np.array(keep, dtype=np.int64)
+
+        t_clean = t[keep]
+        acc_clean = seg['acc'][keep]
+        gyro_clean = seg['gyro'][keep]
+        speed_clean = seg['gt_speed'][keep]
+        dist_clean = seg['gt_distance_m'][keep]
+        enu_clean = seg['gt_enu'][keep]
+        quat_clean = seg['gt_quat'][keep]
+
+        t_target = np.arange(t_clean[0], t_clean[-1] - 1e-6, step)
+        t_target = t_target[(t_target >= t_clean[0]) & (t_target <= t_clean[-1])]
+        if len(t_target) < 10:
+            continue
+
+        pchip_acc = PchipInterpolator(t_clean, acc_clean)(t_target).astype(np.float32)
+        pchip_gyro = PchipInterpolator(t_clean, gyro_clean)(t_target).astype(np.float32)
+        pchip_speed = np.clip(PchipInterpolator(t_clean, speed_clean)(t_target), 0.0, 70.0).astype(np.float32)
+        pchip_dist = PchipInterpolator(t_clean, dist_clean)(t_target).astype(np.float32)
+        pchip_enu = PchipInterpolator(t_clean, enu_clean)(t_target).astype(np.float32)
+
+        # Slerp for orientation
+        q_norm = np.linalg.norm(quat_clean, axis=-1, keepdims=True)
+        q_norm = np.where(q_norm < 1e-6, 1.0, q_norm)
+        quat_normed = quat_clean / q_norm
+        rots = R.from_quat(quat_normed)
+        slerp = Slerp(t_clean, rots)
+        slerp_quat = slerp(t_target).as_quat().astype(np.float32)
+
+        if synthesize_harmonics:
+            vib_a, vib_g = synthesize_vehicle_vibrations(t_target, pchip_speed, sample_rate=target_freq)
+            pchip_acc += vib_a
+            pchip_gyro += vib_g
+
+        dt_arr = np.ones(len(t_target), dtype=np.float32) * step
+
+        resampled_segments.append({
+            'filepath': seg.get('filepath', ''),
+            'v_filepath': seg.get('v_filepath', None),
+            'time_s': t_target,
+            'dt': dt_arr,
+            'acc': pchip_acc,
+            'gyro': pchip_gyro,
+            'gt_speed': pchip_speed,
+            'gt_distance_m': pchip_dist,
+            'gt_enu': pchip_enu,
+            'gt_quat': slerp_quat,
+            'has_vehicle_can': seg.get('has_vehicle_can', False),
+            'sampling_freq': target_freq
+        })
+
+    return resampled_segments
+
 
 class TriStreamDataset(Dataset):
     """
-    PyTorch Dataset for windowed Multi-Modal Tri-Stream AVNet training.
-    Produces decoupled (acc, gyro, mag) windows + speed and delta quaternion targets.
+    PyTorch Dataset for windowed 6-Axis Dual-Stream AVNet training.
+    Produces decoupled (acc, gyro) windows + speed and delta quaternion targets.
+    Completely eliminates magnetometer / magnetic moments to prevent vehicle cabin distortion.
+    Supports continuous-time high-frequency extrapolation (e.g. 100 Hz or 200 Hz).
     """
-    def __init__(self, data_dict_list, window_size=20, step=2, augment=False):
+    def __init__(self, data_dict_list, window_size=20, step=2, augment=False,
+                 target_freq=None, synthesize_harmonics=True):
         self.samples = []
         self.window_size = window_size
         self.augment = augment
@@ -284,10 +445,19 @@ class TriStreamDataset(Dataset):
         if not isinstance(data_dict_list, list):
             data_dict_list = [data_dict_list]
 
+        if target_freq is not None:
+            processed = []
+            for d in data_dict_list:
+                resampled = resample_to_frequency(d, target_freq=target_freq, synthesize_harmonics=synthesize_harmonics)
+                if isinstance(resampled, list):
+                    processed.extend(resampled)
+                else:
+                    processed.append(resampled)
+            data_dict_list = processed
+
         for data in data_dict_list:
             acc = data['acc'].astype(np.float32)
             gyro = data['gyro'].astype(np.float32)
-            mag = data['mag'].astype(np.float32)
             speed = data['gt_speed'].astype(np.float32)
             quat = data['gt_quat']
             dist = data['gt_distance_m'].astype(np.float32)
@@ -306,7 +476,6 @@ class TriStreamDataset(Dataset):
 
                 acc_win = acc[start_idx:end_idx + 1].T   # (3, W)
                 gyro_win = gyro[start_idx:end_idx + 1].T # (3, W)
-                mag_win = mag[start_idx:end_idx + 1].T   # (3, W)
 
                 target_speed = float(speed[end_idx])
                 if np.isnan(target_speed) or np.isinf(target_speed):
@@ -332,7 +501,7 @@ class TriStreamDataset(Dataset):
 
                 if np.isnan(target_delta_q).any() or np.isinf(target_delta_q).any():
                     continue
-                if np.isnan(acc_win).any() or np.isnan(gyro_win).any() or np.isnan(mag_win).any():
+                if np.isnan(acc_win).any() or np.isnan(gyro_win).any():
                     continue
 
                 delta_dist = float(dist[end_idx] - dist[start_idx])
@@ -344,7 +513,6 @@ class TriStreamDataset(Dataset):
                 self.samples.append({
                     'acc': torch.tensor(acc_win, dtype=torch.float32),   # (3, W)
                     'gyro': torch.tensor(gyro_win, dtype=torch.float32), # (3, W)
-                    'mag': torch.tensor(mag_win, dtype=torch.float32),   # (3, W)
                     # Normalize speed to [0, 1] so the model learns a scale-invariant speed signal
                     'target_speed': torch.tensor([target_speed / SPEED_SCALE], dtype=torch.float32),  # (1,) normalized
                     'target_is_stopped': torch.tensor([is_stopped], dtype=torch.float32), # (1,) binary ZUPT flag
@@ -362,12 +530,10 @@ class TriStreamDataset(Dataset):
 
         acc = sample['acc'].clone()
         gyro = sample['gyro'].clone()
-        mag = sample['mag'].clone()
 
         # 1. Random sensor bias jitter (forces model to ignore phone-specific DC offsets)
         b_acc = (torch.rand(3, 1) - 0.5) * 0.3    # +/- 0.15 m/s^2 bias shift
         b_gyro = (torch.rand(3, 1) - 0.5) * 0.02  # +/- 0.01 rad/s bias shift
-        b_mag = (torch.rand(3, 1) - 0.5) * 10.0   # +/- 5.0 uT magnetic cabin offset
 
         # 2. Random vibration amplitude scale jitter (0.85x to 1.15x)
         # Prevents memorizing specific vehicle suspension stiffness or mount dampening
@@ -375,7 +541,6 @@ class TriStreamDataset(Dataset):
 
         acc = (acc + b_acc) * vibe_scale
         gyro = (gyro + b_gyro) * vibe_scale
-        mag = mag + b_mag
 
         # 3. Gaussian sensor noise jitter (simulates varying MEMS chip quality)
         acc = acc + torch.randn_like(acc) * 0.02
@@ -384,12 +549,15 @@ class TriStreamDataset(Dataset):
         return {
             'acc': acc,
             'gyro': gyro,
-            'mag': mag,
             'target_speed': sample['target_speed'],
             'target_is_stopped': sample['target_is_stopped'],
             'target_delta_q': sample['target_delta_q'],
             'delta_dist': sample['delta_dist']
         }
+
+
+# Aliases
+DualStreamDataset = TriStreamDataset
 
 
 # Legacy wrapper for backward compatibility with older tests
@@ -433,10 +601,11 @@ class AVNetDataset(Dataset):
 
 def create_dataloaders(root_dir='data', window_size=20, step=2, batch_size=64,
                        train_ratio=0.8, val_ratio=0.1, limit_files=None, num_workers=0, seed=42,
-                       split_mode='temporal'):
+                       split_mode='temporal', target_freq=None, synthesize_harmonics=True):
     """
     High-level factory function: discovers paired files, loads and windowizes them,
     and returns (train_loader, val_loader, test_loader).
+    Supports optional continuous-time high-frequency extrapolation (e.g. target_freq=100.0 or 200.0).
 
     split_mode:
       - 'temporal' (Default & Recommended): Splits each driving session temporally
@@ -530,9 +699,12 @@ def create_dataloaders(root_dir='data', window_size=20, step=2, batch_size=64,
         print("Loading test files...")
         test_data = load_pair_list(test_pairs)
 
-    train_ds = TriStreamDataset(train_data, window_size=window_size, step=step, augment=True)
-    val_ds = TriStreamDataset(val_data, window_size=window_size, step=step * 2, augment=False)
-    test_ds = TriStreamDataset(test_data, window_size=window_size, step=step * 2, augment=False)
+    train_ds = TriStreamDataset(train_data, window_size=window_size, step=step, augment=True,
+                                target_freq=target_freq, synthesize_harmonics=synthesize_harmonics)
+    val_ds = TriStreamDataset(val_data, window_size=window_size, step=step * 2, augment=False,
+                              target_freq=target_freq, synthesize_harmonics=synthesize_harmonics)
+    test_ds = TriStreamDataset(test_data, window_size=window_size, step=step * 2, augment=False,
+                               target_freq=target_freq, synthesize_harmonics=synthesize_harmonics)
 
     print(f"Windows extracted: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
 
