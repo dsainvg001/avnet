@@ -112,18 +112,23 @@ def evaluate_model(model, dataloader, lambda_att=3.0, lambda_zupt=2.0, device='c
 
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
-                          epochs=15, lr=8e-4, lambda_att=3.0, lambda_zupt=2.0,
-                          weight_decay=3e-4, patience=15,
+                          epochs=25, lr=6e-4, lambda_att=2.0, lambda_zupt=2.0,
+                          weight_decay=1e-4, patience=15, scheduler_type='plateau',
                           checkpoint_dir='checkpoints', device='cpu'):
     """
-    Train TriStreamAVNet with multi-task Huber + Geodesic + ZUPT BCE loss and Cosine Annealing.
+    Train DualStreamAVNet with multi-task Huber + Geodesic + ZUPT BCE loss and dynamic LR scheduling.
+    Supports ReduceLROnPlateau (drops LR when val loss plateaus) and Cosine Annealing.
     Includes early stopping (patience) and saves best/latest checkpoints as .pth and .pkl.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     model.to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    if scheduler_type == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-5)
+    else:
+        effective_tmax = min(epochs, 30)
+        scheduler = CosineAnnealingLR(optimizer, T_max=effective_tmax, eta_min=1e-5)
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
@@ -136,8 +141,8 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
         'learning_rate': []
     }
 
-    print(f"Starting TriStreamAVNet training on device: {device}")
-    print(f"Total Epochs: {epochs}, Initial LR: {lr}, Lambda Att: {lambda_att}, Lambda ZUPT: {lambda_zupt}")
+    print(f"Starting DualStreamAVNet training on device: {device}")
+    print(f"Total Epochs: {epochs}, Initial LR: {lr}, Scheduler: {scheduler_type}, Lambda Att: {lambda_att}, Lambda ZUPT: {lambda_zupt}")
     start_time = time.time()
 
     for epoch in range(epochs):
@@ -180,12 +185,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             running_zupt_loss += loss_zupt.item() * batch_size
             total_samples += batch_size
 
-        scheduler.step()
         epoch_train_loss = (running_loss / max(1, total_samples)) if total_samples > 0 else 0.0
-        current_lr = scheduler.get_last_lr()[0]
-
-        history['train_loss'].append(epoch_train_loss)
-        history['learning_rate'].append(current_lr)
 
         # Validation
         if val_loader is not None and len(val_loader) > 0:
@@ -195,10 +195,19 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             att_deg = val_metrics['att_error_deg']
             zupt_acc = val_metrics['zupt_acc']
 
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+                current_lr = optimizer.param_groups[0]['lr']
+            else:
+                scheduler.step()
+                current_lr = scheduler.get_last_lr()[0]
+
+            history['train_loss'].append(epoch_train_loss)
             history['val_loss'].append(val_loss)
             history['speed_rmse'].append(speed_rmse)
             history['att_error_deg'].append(att_deg)
             history['zupt_acc'].append(zupt_acc)
+            history['learning_rate'].append(current_lr)
 
             print(f"Epoch [{epoch+1:02d}/{epochs:02d}] "
                   f"Train Loss: {epoch_train_loss:.5f} | "

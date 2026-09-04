@@ -75,8 +75,16 @@ class DualStreamAVNet(nn.Module):
             nn.Dropout(0.1)
         )
 
+        # Speed Kinematic Fusion: Combines Accel (64) + Gyro (64) = 128 channels
+        # Directly resolves centripetal acceleration (v = a_lat / omega_yaw) and pitch dynamics
+        self.speed_fuse = nn.Sequential(
+            nn.Conv1d(128, 64, kernel_size=1),
+            nn.BatchNorm1d(64),
+            nn.GELU()
+        )
+
         # Decoupled Task Recurrent Processors:
-        # 1. Speed Recurrent Stream (focuses purely on acceleration dynamics)
+        # 1. Speed Recurrent Stream (processes fused Accel + Gyro dynamics)
         self.speed_gru = nn.GRU(
             input_size=64,
             hidden_size=hidden_dim,
@@ -122,7 +130,7 @@ class DualStreamAVNet(nn.Module):
 
     def forward(self, acc, gyro, mag=None, return_zupt=False):
         """
-        Forward pass (6-axis IMU only, magnetometer is ignored).
+        Forward pass (6-axis IMU with dynamic acceleration and centripetal fusion).
         Args:
             acc: (B, 3, W) or (B, W, 3) - Accelerometer stream
             gyro: (B, 3, W) or (B, W, 3) - Gyroscope stream
@@ -138,28 +146,34 @@ class DualStreamAVNet(nn.Module):
         if gyro.dim() == 3 and gyro.size(-1) == 3:
             gyro = gyro.transpose(1, 2)
 
-        # Standardize physical sensor scales
-        acc_scaled = acc / 9.81
-        gyro_scaled = gyro
+        # Dynamic Acceleration: remove static tilt/gravity offset over the window
+        # acc_mean isolates the static gravity vector projected onto the phone's tilted mount
+        acc_mean = torch.mean(acc, dim=-1, keepdim=True)
+        acc_dyn = acc - acc_mean  # Pure dynamic vehicle motion!
+        acc_dyn_scaled = acc_dyn / 3.0  # Normalized to [-1, 1] range for vehicle acceleration
 
-        # Compute rotation-invariant Euclidean norm as 4th channel
-        acc_norm = torch.norm(acc_scaled, p=2, dim=1, keepdim=True)
+        # Gyroscope scaling
+        gyro_scaled = gyro  # rad/s
+
+        # Rotation-invariant Euclidean norms
+        acc_dyn_norm = torch.norm(acc_dyn_scaled, p=2, dim=1, keepdim=True)
         gyro_norm = torch.norm(gyro_scaled, p=2, dim=1, keepdim=True)
 
-        acc_in = torch.cat([acc_scaled, acc_norm], dim=1)   # (B, 4, W)
-        gyro_in = torch.cat([gyro_scaled, gyro_norm], dim=1) # (B, 4, W)
+        acc_in = torch.cat([acc_dyn_scaled, acc_dyn_norm], dim=1)   # (B, 4, W)
+        gyro_in = torch.cat([gyro_scaled, gyro_norm], dim=1)        # (B, 4, W)
 
         # 1. Feature extraction
         f_acc = self.acc_branch(acc_in)    # (B, 64, W)
         f_gyro = self.gyro_branch(gyro_in) # (B, 64, W)
 
-        # 2. Decoupled Path A: Forward Speed (DDODO) & Stationary Detection (DDZUPT)
-        out_spd, _ = self.speed_gru(f_acc.transpose(1, 2))  # (B, W, 128)
+        # 2. Speed Path: Fused Accel + Gyro for centripetal and longitudinal kinematics
+        f_speed = self.speed_fuse(torch.cat([f_acc, f_gyro], dim=1)) # (B, 64, W)
+        out_spd, _ = self.speed_gru(f_speed.transpose(1, 2))          # (B, W, 128)
         feat_spd = torch.cat([out_spd[:, -1, :], torch.mean(out_spd, dim=1)], dim=-1) # (B, 256)
         v_lon = self.ddodo_head(feat_spd)  # (B, 1) strictly in [0, 1]
         p_stop = self.zupt_head(feat_spd)  # (B, 1) stationary probability in [0, 1]
 
-        # 3. Decoupled Path B: Attitude Change (DDATT)
+        # 3. Attitude Path: Pure Gyroscope kinematics
         out_att, _ = self.att_gru(f_gyro.transpose(1, 2))         # (B, W, 128)
         feat_att = torch.cat([out_att[:, -1, :], torch.mean(out_att, dim=1)], dim=-1) # (B, 256)
         dq_xyz = self.ddatt_head(feat_att) # (B, 3)

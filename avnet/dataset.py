@@ -84,14 +84,18 @@ def load_iovnbd_csv(filepath, v_filepath=None):
     # Clean and forward-fill sensor readings
     acc = pd.DataFrame(df[acc_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
     gyro = pd.DataFrame(df[gyro_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
-    if len(mag_cols) >= 3:
-        mag = pd.DataFrame(df[mag_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
+
+    gravity_cols = [c for c in df.columns if 'GRAVITY' in c]
+    if len(gravity_cols) >= 3:
+        gravity = pd.DataFrame(df[gravity_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
     else:
-        mag = np.zeros((len(df), 3), dtype=np.float32)
+        # Fallback: estimate gravity as low-pass rolling mean of accelerometer
+        gravity = pd.DataFrame(acc).rolling(window=30, min_periods=1, center=True).mean().values.astype(np.float32)
 
     acc = np.nan_to_num(acc, nan=0.0)
     gyro = np.nan_to_num(gyro, nan=0.0)
-    mag = np.nan_to_num(mag, nan=0.0)
+    gravity = np.nan_to_num(gravity, nan=0.0)
+    acc_dyn = acc - gravity
 
     # Auto-detect matching vehicle CAN file if not provided (case-insensitive for Linux/Kaggle)
     if v_filepath is None:
@@ -160,26 +164,27 @@ def load_iovnbd_csv(filepath, v_filepath=None):
 
     gt_enu = latlon_to_enu(lat, lon, alt)
 
-    # Ground truth vehicle orientation: Use true vehicle Heading from V-Dataset if available
-    v_heading_cols = [c for c in df_v.columns if 'Heading' in c] if has_vehicle_can else []
-    if v_heading_cols:
-        heading_deg = pd.Series(df_v[v_heading_cols[0]]).ffill().bfill().fillna(0.0).astype(float).values
-        yaw_enu_deg = (90.0 - heading_deg) % 360.0
-        rotations = R.from_euler('z', yaw_enu_deg.reshape(-1, 1), degrees=True)
+    # Smartphone AHRS true 3D orientation (R^w_s):
+    # AVNet DDATT predicts the sensor's own attitude change in world frame,
+    # which is 100% physically invariant to phone mounting angle.
+    orient_yaw = [c for c in df.columns if ('ORIENTATION (Yaw)' in c or 'ORIENTATION (Azimuth)' in c or c == 'ORIENTATION YAW')]
+    orient_pitch = [c for c in df.columns if ('ORIENTATION (Pitch)' in c or c == 'ORIENTATION PITCH')]
+    orient_roll = [c for c in df.columns if ('ORIENTATION (Roll' in c or c == 'ORIENTATION ROLL')]
+
+    if orient_yaw and orient_pitch and orient_roll:
+        azimuth = pd.Series(df[orient_yaw[0]]).ffill().bfill().fillna(0.0).astype(float).values
+        pitch = pd.Series(df[orient_pitch[0]]).ffill().bfill().fillna(0.0).astype(float).values
+        roll = pd.Series(df[orient_roll[0]]).ffill().bfill().fillna(0.0).astype(float).values
+
+        rotations = R.from_euler('zyx', np.stack([azimuth, pitch, roll], axis=-1), degrees=True)
         gt_quat = rotations.as_quat() # [x, y, z, w]
     else:
-        # Fallback to phone orientation
-        orient_yaw = [c for c in df.columns if ('ORIENTATION (Yaw)' in c or 'ORIENTATION (Azimuth)' in c or c == 'ORIENTATION YAW')]
-        orient_pitch = [c for c in df.columns if ('ORIENTATION (Pitch)' in c or c == 'ORIENTATION PITCH')]
-        orient_roll = [c for c in df.columns if ('ORIENTATION (Roll' in c or c == 'ORIENTATION ROLL')]
-
-        if orient_yaw and orient_pitch and orient_roll:
-            azimuth = pd.Series(df[orient_yaw[0]]).ffill().bfill().fillna(0.0).astype(float).values
-            pitch = pd.Series(df[orient_pitch[0]]).ffill().bfill().fillna(0.0).astype(float).values
-            roll = pd.Series(df[orient_roll[0]]).ffill().bfill().fillna(0.0).astype(float).values
-
-            rotations = R.from_euler('zyx', np.stack([azimuth, pitch, roll], axis=-1), degrees=True)
-            gt_quat = rotations.as_quat() # [x, y, z, w]
+        v_heading_cols = [c for c in df_v.columns if 'Heading' in c] if has_vehicle_can else []
+        if v_heading_cols:
+            heading_deg = pd.Series(df_v[v_heading_cols[0]]).ffill().bfill().fillna(0.0).astype(float).values
+            yaw_enu_deg = (90.0 - heading_deg) % 360.0
+            rotations = R.from_euler('z', yaw_enu_deg.reshape(-1, 1), degrees=True)
+            gt_quat = rotations.as_quat()
         else:
             gt_quat = np.tile([0.0, 0.0, 0.0, 1.0], (len(df), 1))
 
@@ -195,13 +200,14 @@ def load_iovnbd_csv(filepath, v_filepath=None):
         'v_filepath': v_filepath,
         'time_s': time_ms / 1000.0,
         'dt': dt,
-        'acc': acc,              # (N, 3) specific forces [m/s^2]
-        'gyro': gyro,            # (N, 3) angular velocity [rad/s]
-        'mag': mag,              # (N, 3) magnetic field [uT]
-        'gt_speed': speed_ms,    # (N,) ground truth scalar forward speed [m/s]
+        'acc': acc,                  # (N, 3) raw specific forces [m/s^2]
+        'acc_dyn': acc_dyn,          # (N, 3) gravity-subtracted dynamic acceleration [m/s^2]
+        'gravity': gravity,          # (N, 3) static gravity component [m/s^2]
+        'gyro': gyro,                # (N, 3) angular velocity [rad/s]
+        'gt_speed': speed_ms,        # (N,) ground truth scalar forward speed [m/s]
         'gt_distance_m': gt_distance_m, # (N,) high-precision integrated distance [m]
-        'gt_enu': gt_enu,        # (N, 3) ground truth ENU position [m]
-        'gt_quat': gt_quat,      # (N, 4) ground truth quaternion [x, y, z, w]
+        'gt_enu': gt_enu,            # (N, 3) ground truth ENU position [m]
+        'gt_quat': gt_quat,          # (N, 4) sensor true attitude quaternion [x, y, z, w]
         'has_vehicle_can': has_vehicle_can,
     }
 
