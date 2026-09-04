@@ -125,10 +125,15 @@ class TriStreamAVNet(nn.Module):
         elif mag.dim() == 3 and mag.size(-1) == 3:
             mag = mag.transpose(1, 2)
 
+        # Standardize physical sensor scales to [-1, +1] range
+        acc_scaled = acc / 9.81
+        gyro_scaled = gyro # rad/s is already order of ~0.1 - 1.0
+        mag_scaled = mag / 50.0 # ~50 uT field scaled to unit order
+
         # 1. Decoupled feature extraction
-        f_acc = self.acc_branch(acc)   # (B, 64, W)
-        f_gyro = self.gyro_branch(gyro)# (B, 64, W)
-        f_mag = self.mag_branch(mag)   # (B, 64, W)
+        f_acc = self.acc_branch(acc_scaled)   # (B, 64, W)
+        f_gyro = self.gyro_branch(gyro_scaled)# (B, 64, W)
+        f_mag = self.mag_branch(mag_scaled)   # (B, 64, W)
 
         # 2. Gated Cross-Sensor Fusion
         f_cat = torch.cat([f_acc, f_gyro, f_mag], dim=1) # (B, 192, W)
@@ -179,9 +184,10 @@ class AdapterNet9Axis(nn.Module):
         params = self.fc(out_last) # (B, out_dim)
         return params
 
-    def get_covariances(self, x, q_default=None, n_default=None, beta=3.0):
+    def get_covariances(self, x, q_default=None, n_default=None, beta=1.0):
         """
-        Convenience function: computes physical Q and N covariance matrices.
+        Convenience function: computes physical Q and N covariance scaling matrices.
+        Beta defaults to 1.0 (bounding adjustments to [0.1, 10.0] factor to prevent filter explosion).
         """
         params = self.forward(x) # (B, 6)
         q_raw = params[:, 0:3]

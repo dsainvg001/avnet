@@ -87,7 +87,8 @@ class InEKF:
         if N_att is None:
             N_att = np.eye(3, dtype=np.float64) * 1e-2
 
-        R_err = self.R_w_s @ R_meas.T
+        # Right-invariant attitude residual: log(R_meas @ R_est^T)
+        R_err = R_meas @ self.R_w_s.T
         r_err = R.from_matrix(R_err).as_rotvec()
 
         H = np.zeros((3, 21), dtype=np.float64)
@@ -103,12 +104,13 @@ class InEKF:
 
     def update_ddodo(self, v_lon_meas, gyro_meas, N_vel=None):
         if N_vel is None:
-            N_vel = np.diag([1e-1, 1e-2, 1e-1])
+            N_vel = np.diag([1e-2, 1e-1, 1e-1])
 
         omega = gyro_meas - self.bg
         v_body_pred = self.R_v_s @ (self.R_w_s.T @ self.v_w_s + np.cross(omega, self.p_s_v))
 
-        v_meas = np.array([0.0, v_lon_meas, 0.0], dtype=np.float64)
+        # Vehicle frame: X is forward (longitudinal), Y is lateral, Z is vertical
+        v_meas = np.array([v_lon_meas, 0.0, 0.0], dtype=np.float64)
         innov = v_meas - v_body_pred
 
         H = np.zeros((3, 21), dtype=np.float64)

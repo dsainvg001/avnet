@@ -64,7 +64,7 @@ def evaluate_model(model, dataloader, device='cpu'):
             if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isinf(l_speed) or torch.isinf(l_att):
                 continue
 
-            loss = l_speed + 5.0 * l_att
+            loss = l_speed + 50.0 * l_att
             val_loss_sum += loss.item() * acc.size(0)
             total_samples += acc.size(0)
 
@@ -96,7 +96,7 @@ def evaluate_model(model, dataloader, device='cpu'):
 
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
-                          epochs=15, lr=1e-3, lambda_att=5.0,
+                          epochs=15, lr=5e-4, lambda_att=50.0,
                           weight_decay=1e-4, checkpoint_dir='checkpoints',
                           device='cpu'):
     """

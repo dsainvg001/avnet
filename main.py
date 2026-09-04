@@ -47,15 +47,16 @@ def run_evaluation(avnet_model, adapter_model, eval_data, device='cpu', output_d
 
     print(f"Evaluating trajectory over {N} samples ({N * 0.1 / 60:.2f} minutes)...")
 
-    # Initial state
+    # Initial state: forward direction is along axis X
     R0 = R.from_quat(gt_quat[0]).as_matrix()
-    v0_body = np.array([0.0, gt_speed[0], 0.0])
+    v0_body = np.array([gt_speed[0], 0.0, 0.0], dtype=np.float64)
     v0_world = R0 @ v0_body
 
     inekf = InEKF(R0=R0, v0=v0_world, p0=gt_enu[0])
 
     pred_positions = np.zeros((N, 3))
     pred_quats = np.zeros((N, 4))
+    pred_quats[0] = gt_quat[0]
     window_size = 20
 
     imu9 = np.concatenate([acc, gyro, mag], axis=-1).astype(np.float32)
@@ -74,7 +75,8 @@ def run_evaluation(avnet_model, adapter_model, eval_data, device='cpu', output_d
                 n_s = n_s.cpu().numpy()[0]
 
                 Q_dyn = inekf.Q_default * np.tile(q_s, 6)
-                N_vel_dyn = np.diag([0.1 * n_s[0], 0.01 * n_s[1], 0.1 * n_s[2]])
+                # Forward axis is X (index 0)
+                N_vel_dyn = np.diag([0.01 * n_s[0], 0.1 * n_s[1], 0.1 * n_s[2]])
             else:
                 Q_dyn = inekf.Q_default
                 N_vel_dyn = None
@@ -82,23 +84,23 @@ def run_evaluation(avnet_model, adapter_model, eval_data, device='cpu', output_d
             # 2. InEKF Kinematic Propagation
             inekf.propagate(w, f, dt, Q=Q_dyn)
 
-            # 3. AVNet Measurement Update (every 100 ms or sliding window)
+            # 3. AVNet Measurement Update (every 100 ms sliding window)
             if i >= window_size:
                 acc_w = torch.tensor(acc[i - window_size:i].T, dtype=torch.float32).unsqueeze(0).to(device)
                 gyro_w = torch.tensor(gyro[i - window_size:i].T, dtype=torch.float32).unsqueeze(0).to(device)
                 mag_w = torch.tensor(mag[i - window_size:i].T, dtype=torch.float32).unsqueeze(0).to(device)
 
                 v_lon_t, dq_xyz_t = avnet_model(acc_w, gyro_w, mag_w)
-                v_lon = v_lon_t.item()
+                v_lon = max(0.0, v_lon_t.item()) # speed cannot be negative
                 dq_vec = dq_xyz_t.cpu().numpy()[0]
 
                 # Update speed
                 inekf.update_ddodo(v_lon, w, N_vel=N_vel_dyn)
 
-                # Update attitude
+                # Update attitude using filter's own estimated history (pure dead reckoning)
                 w_comp = np.sqrt(max(0.0, 1.0 - np.sum(dq_vec**2)))
                 dq_rel = R.from_quat([dq_vec[0], dq_vec[1], dq_vec[2], w_comp])
-                R_win_start = R.from_quat(gt_quat[i - window_size])
+                R_win_start = R.from_quat(pred_quats[i - window_size]) if i > window_size else R.from_matrix(R0)
                 R_meas = (R_win_start * dq_rel).as_matrix()
                 inekf.update_ddatt(R_meas)
 
