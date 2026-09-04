@@ -38,15 +38,17 @@ def compute_attitude_loss(pred_dq_xyz, target_dq_xyz):
     return chordal_loss + 2.0 * mse_loss
 
 
-def evaluate_model(model, dataloader, lambda_att=3.0, device='cpu'):
+def evaluate_model(model, dataloader, lambda_att=3.0, lambda_zupt=2.0, device='cpu'):
     """
-    Compute validation metrics: Speed RMSE (m/s) and Attitude Geodesic Error (degrees).
+    Compute validation metrics: Speed RMSE (m/s), Attitude Geodesic Error (degrees), and ZUPT Accuracy (%).
     target_speed in the dataloader is normalized by SPEED_SCALE; we denormalize for RMSE reporting.
     """
     model.eval()
     total_samples = 0
     speed_sq_errors = []
     att_deg_errors = []
+    zupt_correct = 0
+    zupt_total = 0
     val_loss_sum = 0.0
 
     with torch.no_grad():
@@ -56,20 +58,28 @@ def evaluate_model(model, dataloader, lambda_att=3.0, device='cpu'):
             mag = batch['mag'].to(device)
             target_speed = batch['target_speed'].to(device)  # normalized [0, 1]
             target_dq = batch['target_delta_q'].to(device)
+            target_stop = batch.get('target_is_stopped', (target_speed < 0.3 / SPEED_SCALE).float()).to(device)
 
-            pred_speed, pred_dq = model(acc, gyro, mag)
+            pred_speed, pred_dq, pred_stop = model(acc, gyro, mag, return_zupt=True)
             # Clamp in normalized [0, 1] space (corresponds to 0–30 m/s)
             pred_speed = torch.clamp(pred_speed, min=0.0, max=1.0)
+            pred_stop = torch.clamp(pred_stop, min=1e-7, max=1.0 - 1e-7)
 
             l_speed = F.smooth_l1_loss(pred_speed, target_speed, beta=0.1)
             l_att = compute_attitude_loss(pred_dq, target_dq)
+            l_zupt = F.binary_cross_entropy(pred_stop, target_stop)
 
-            if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isinf(l_speed) or torch.isinf(l_att):
+            if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isnan(l_zupt) or torch.isinf(l_speed) or torch.isinf(l_att) or torch.isinf(l_zupt):
                 continue
 
-            loss = l_speed + lambda_att * l_att
+            loss = l_speed + lambda_att * l_att + lambda_zupt * l_zupt
             val_loss_sum += loss.item() * acc.size(0)
             total_samples += acc.size(0)
+
+            # ZUPT accuracy
+            pred_binary = (pred_stop > 0.5).float()
+            zupt_correct += (pred_binary == (target_stop > 0.5).float()).sum().item()
+            zupt_total += target_stop.numel()
 
             # Denormalize speed for human-readable RMSE in m/s
             pred_mps = (pred_speed * SPEED_SCALE).cpu().numpy().flatten()
@@ -92,20 +102,22 @@ def evaluate_model(model, dataloader, lambda_att=3.0, device='cpu'):
     avg_val_loss = (val_loss_sum / max(1, total_samples)) if total_samples > 0 else 0.0
     speed_rmse = np.sqrt(np.mean(speed_sq_errors)) if len(speed_sq_errors) > 0 else 0.0
     mean_att_deg = np.mean(att_deg_errors) if len(att_deg_errors) > 0 else 0.0
+    zupt_acc = (zupt_correct / max(1, zupt_total)) * 100.0 if zupt_total > 0 else 0.0
 
     return {
         'val_loss': float(avg_val_loss),
         'speed_rmse_mps': float(speed_rmse),
-        'att_error_deg': float(mean_att_deg)
+        'att_error_deg': float(mean_att_deg),
+        'zupt_acc': float(zupt_acc)
     }
 
 
 def train_tristream_avnet(model, train_loader, val_loader=None,
-                          epochs=15, lr=8e-4, lambda_att=3.0,
+                          epochs=15, lr=8e-4, lambda_att=3.0, lambda_zupt=2.0,
                           weight_decay=3e-4, patience=15,
                           checkpoint_dir='checkpoints', device='cpu'):
     """
-    Train TriStreamAVNet with multi-task Huber + Geodesic loss and Cosine Annealing.
+    Train TriStreamAVNet with multi-task Huber + Geodesic + ZUPT BCE loss and Cosine Annealing.
     Includes early stopping (patience) and saves best/latest checkpoints as .pth and .pkl.
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -121,11 +133,12 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
         'val_loss': [],
         'speed_rmse': [],
         'att_error_deg': [],
+        'zupt_acc': [],
         'learning_rate': []
     }
 
     print(f"Starting TriStreamAVNet training on device: {device}")
-    print(f"Total Epochs: {epochs}, Initial LR: {lr}, Lambda Att: {lambda_att}")
+    print(f"Total Epochs: {epochs}, Initial LR: {lr}, Lambda Att: {lambda_att}, Lambda ZUPT: {lambda_zupt}")
     start_time = time.time()
 
     for epoch in range(epochs):
@@ -133,6 +146,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
         running_loss = 0.0
         running_speed_loss = 0.0
         running_att_loss = 0.0
+        running_zupt_loss = 0.0
         total_samples = 0
 
         for step, batch in enumerate(train_loader):
@@ -141,17 +155,17 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             mag = batch['mag'].to(device)
             target_speed = batch['target_speed'].to(device)
             target_dq = batch['target_delta_q'].to(device)
+            target_stop = batch.get('target_is_stopped', (target_speed < 0.3 / SPEED_SCALE).float()).to(device)
 
             optimizer.zero_grad()
 
-            pred_speed, pred_dq = model(acc, gyro, mag)
+            pred_speed, pred_dq, pred_stop = model(acc, gyro, mag, return_zupt=True)
 
             # target_speed is normalized to [0, 1] (SPEED_SCALE = 30 m/s) by the dataset.
-            # Use beta=0.1 SmoothL1 so the quadratic region spans ±3 m/s equivalent.
             loss_speed = F.smooth_l1_loss(pred_speed, target_speed, beta=0.1)
             loss_att = compute_attitude_loss(pred_dq, target_dq)
-            loss_total = loss_speed + lambda_att * loss_att
-
+            loss_zupt = F.binary_cross_entropy(pred_stop, target_stop)
+            loss_total = loss_speed + lambda_att * loss_att + lambda_zupt * loss_zupt
 
             if torch.isnan(loss_total) or torch.isinf(loss_total):
                 optimizer.zero_grad()
@@ -165,6 +179,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             running_loss += loss_total.item() * batch_size
             running_speed_loss += loss_speed.item() * batch_size
             running_att_loss += loss_att.item() * batch_size
+            running_zupt_loss += loss_zupt.item() * batch_size
             total_samples += batch_size
 
         scheduler.step()
@@ -176,20 +191,23 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
 
         # Validation
         if val_loader is not None and len(val_loader) > 0:
-            val_metrics = evaluate_model(model, val_loader, lambda_att=lambda_att, device=device)
+            val_metrics = evaluate_model(model, val_loader, lambda_att=lambda_att, lambda_zupt=lambda_zupt, device=device)
             val_loss = val_metrics['val_loss']
             speed_rmse = val_metrics['speed_rmse_mps']
             att_deg = val_metrics['att_error_deg']
+            zupt_acc = val_metrics['zupt_acc']
 
             history['val_loss'].append(val_loss)
             history['speed_rmse'].append(speed_rmse)
             history['att_error_deg'].append(att_deg)
+            history['zupt_acc'].append(zupt_acc)
 
             print(f"Epoch [{epoch+1:02d}/{epochs:02d}] "
                   f"Train Loss: {epoch_train_loss:.5f} | "
                   f"Val Loss: {val_loss:.5f} | "
-                  f"Speed RMSE: {speed_rmse:.3f} m/s | "
+                  f"ZUPT Acc: {zupt_acc:.1f}% | "
                   f"Att Error: {att_deg:.2f}° | "
+                  f"Speed RMSE: {speed_rmse:.3f} m/s | "
                   f"LR: {current_lr:.6f}")
 
             # Save best checkpoint
@@ -206,6 +224,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
                     'val_loss': val_loss,
                     'speed_rmse': speed_rmse,
                     'att_deg': att_deg,
+                    'zupt_acc': zupt_acc,
                     'model_config': {'window_size': model.window_size, 'hidden_dim': model.hidden_dim}
                 }
                 torch.save(checkpoint_data, best_pth)

@@ -118,22 +118,33 @@ class TriStreamAVNet(nn.Module):
             nn.Sigmoid()  # Strictly bounded [0, 1] normalized forward speed
         )
 
+        # Head 2: Zero Velocity Detector (DDZUPT: probability that vehicle is stopped v=0)
+        self.zupt_head = nn.Sequential(
+            nn.Linear(hidden_dim * 4, 32),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 1),
+            nn.Sigmoid()  # [0, 1] probability: 1.0 = stopped at standstill, 0.0 = moving
+        )
+
         self.ddatt_head = nn.Sequential(
             nn.Linear(hidden_dim * 4, 64),
             nn.GELU(),
             nn.Linear(64, 3)  # relative quaternion [qx, qy, qz]
         )
 
-    def forward(self, acc, gyro, mag=None):
+    def forward(self, acc, gyro, mag=None, return_zupt=False):
         """
         Forward pass.
         Args:
             acc: (B, 3, W) or (B, W, 3) - Accelerometer stream
             gyro: (B, 3, W) or (B, W, 3) - Gyroscope stream
             mag: (B, 3, W) or (B, W, 3) - Magnetometer stream (optional, zeros if None)
+            return_zupt: bool - If True, returns (v_lon, dq_xyz, p_stop); if False, returns (v_lon, dq_xyz)
         Returns:
             v_lon: (B, 1) - Predicted forward speed in normalized [0, 1] range
             dq_xyz: (B, 3) - Predicted relative quaternion imaginary part
+            p_stop: (B, 1) - Predicted stationary probability [0, 1] (only if return_zupt=True)
         """
         if acc.dim() == 3 and acc.size(-1) == 3:
             acc = acc.transpose(1, 2)
@@ -164,11 +175,12 @@ class TriStreamAVNet(nn.Module):
         f_gyro = self.gyro_branch(gyro_in) # (B, 64, W)
         f_mag = self.mag_branch(mag_in)   # (B, 64, W)
 
-        # 2. Decoupled Path A: Forward Speed (DDODO)
+        # 2. Decoupled Path A: Forward Speed (DDODO) & Stationary Detection (DDZUPT)
         out_spd, _ = self.speed_gru(f_acc.transpose(1, 2))  # (B, W, 128)
         # Combine final recurrent state (h_last) with temporal mean pool
         feat_spd = torch.cat([out_spd[:, -1, :], torch.mean(out_spd, dim=1)], dim=-1) # (B, 256)
-        v_lon = self.ddodo_head(feat_spd) # (B, 1) strictly in [0, 1]
+        v_lon = self.ddodo_head(feat_spd)  # (B, 1) strictly in [0, 1]
+        p_stop = self.zupt_head(feat_spd)  # (B, 1) stationary probability in [0, 1]
 
         # 3. Decoupled Path B: Attitude Change (DDATT)
         f_rot = self.att_fuse(torch.cat([f_gyro, f_mag], dim=1)) # (B, 64, W)
@@ -176,6 +188,8 @@ class TriStreamAVNet(nn.Module):
         feat_att = torch.cat([out_att[:, -1, :], torch.mean(out_att, dim=1)], dim=-1) # (B, 256)
         dq_xyz = self.ddatt_head(feat_att) # (B, 3)
 
+        if return_zupt:
+            return v_lon, dq_xyz, p_stop
         return v_lon, dq_xyz
 
 

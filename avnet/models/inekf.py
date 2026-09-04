@@ -129,6 +129,64 @@ class InEKF:
         self.P = (np.eye(21) - K @ H) @ self.P
         self.P = 0.5 * (self.P + self.P.T)
 
+    def update_zupt(self, N_zupt=None):
+        """
+        Zero Velocity Update (ZUPT).
+        Enforces body velocity [0, 0, 0] when vehicle is stationary.
+        Rapidly eliminates integrated velocity drift and calibrates accelerometer bias.
+        """
+        if N_zupt is None:
+            N_zupt = np.eye(3, dtype=np.float64) * 1e-4
+
+        v_body_pred = self.R_v_s @ (self.R_w_s.T @ self.v_w_s)
+        innov = -v_body_pred  # 0.0 - v_body_pred
+
+        H = np.zeros((3, 21), dtype=np.float64)
+        R_s_w = self.R_w_s.T
+        H[0:3, 0:3] = self.R_v_s @ skew(R_s_w @ self.v_w_s)
+        H[0:3, 3:6] = self.R_v_s @ R_s_w
+        H[0:3, 15:18] = -skew(v_body_pred)
+
+        S = H @ self.P @ H.T + N_zupt
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        dx = K @ innov
+        self._apply_correction(dx)
+        self.P = (np.eye(21) - K @ H) @ self.P
+        self.P = 0.5 * (self.P + self.P.T)
+
+    def update_nhc(self, gyro_meas, N_nhc=None):
+        """
+        Non-Holonomic Constraint (NHC).
+        Enforces that lateral (Y) and vertical (Z) vehicle velocities are near zero:
+        v_lat = 0, v_up = 0.
+        Preserves forward longitudinal velocity (X) as integrated by INS.
+        """
+        if N_nhc is None:
+            N_nhc = np.diag([1e-2, 1e-2])
+
+        omega = gyro_meas - self.bg
+        v_body_pred = self.R_v_s @ (self.R_w_s.T @ self.v_w_s + np.cross(omega, self.p_s_v))
+        innov = -v_body_pred[1:3]
+
+        H_full = np.zeros((3, 21), dtype=np.float64)
+        R_s_w = self.R_w_s.T
+        H_full[0:3, 0:3] = self.R_v_s @ skew(R_s_w @ self.v_w_s)
+        H_full[0:3, 3:6] = self.R_v_s @ R_s_w
+        H_full[0:3, 9:12] = self.R_v_s @ skew(self.p_s_v)
+        H_full[0:3, 15:18] = -skew(v_body_pred)
+        H_full[0:3, 18:21] = -self.R_v_s @ skew(omega)
+
+        H = H_full[1:3, :]
+
+        S = H @ self.P @ H.T + N_nhc
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        dx = K @ innov
+        self._apply_correction(dx)
+        self.P = (np.eye(21) - K @ H) @ self.P
+        self.P = 0.5 * (self.P + self.P.T)
+
     def _apply_correction(self, dx):
         # Limit correction step size to prevent numerical divergence
         dx_rot = np.clip(dx[0:3], -0.1, 0.1)

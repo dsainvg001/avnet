@@ -13,6 +13,18 @@ class TestModels(unittest.TestCase):
         self.assertEqual(v_lon.shape, (4, 1))
         self.assertEqual(dq.shape, (4, 3))
 
+    def test_tristream_avnet_forward_with_zupt(self):
+        model = TriStreamAVNet(window_size=20, hidden_dim=64)
+        acc = torch.randn(4, 3, 20)
+        gyro = torch.randn(4, 3, 20)
+        mag = torch.randn(4, 3, 20)
+
+        v_lon, dq, p_stop = model(acc, gyro, mag, return_zupt=True)
+        self.assertEqual(v_lon.shape, (4, 1))
+        self.assertEqual(dq.shape, (4, 3))
+        self.assertEqual(p_stop.shape, (4, 1))
+        self.assertTrue(torch.all(p_stop >= 0.0) and torch.all(p_stop <= 1.0))
+
     def test_adapter_9axis_forward(self):
         model = AdapterNet9Axis(in_channels=9, out_dim=6)
         x = torch.randn(4, 9, 20)

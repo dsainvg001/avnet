@@ -339,12 +339,15 @@ class TriStreamDataset(Dataset):
                 if np.isnan(delta_dist) or np.isinf(delta_dist):
                     delta_dist = 0.0
 
+                is_stopped = 1.0 if target_speed < 0.3 else 0.0
+
                 self.samples.append({
                     'acc': torch.tensor(acc_win, dtype=torch.float32),   # (3, W)
                     'gyro': torch.tensor(gyro_win, dtype=torch.float32), # (3, W)
                     'mag': torch.tensor(mag_win, dtype=torch.float32),   # (3, W)
                     # Normalize speed to [0, 1] so the model learns a scale-invariant speed signal
                     'target_speed': torch.tensor([target_speed / SPEED_SCALE], dtype=torch.float32),  # (1,) normalized
+                    'target_is_stopped': torch.tensor([is_stopped], dtype=torch.float32), # (1,) binary ZUPT flag
                     'target_delta_q': torch.tensor(target_delta_q, dtype=torch.float32), # (3,)
                     'delta_dist': torch.tensor([delta_dist], dtype=torch.float32)
                 })
@@ -383,6 +386,7 @@ class TriStreamDataset(Dataset):
             'gyro': gyro,
             'mag': mag,
             'target_speed': sample['target_speed'],
+            'target_is_stopped': sample['target_is_stopped'],
             'target_delta_q': sample['target_delta_q'],
             'delta_dist': sample['delta_dist']
         }

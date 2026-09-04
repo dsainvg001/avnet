@@ -7,7 +7,7 @@ import torch
 from scipy.spatial.transform import Rotation as R
 
 from avnet.dataset import load_iovnbd_csv, discover_paired_iovnbd_files, create_dataloaders
-from avnet.models.avnet import TriStreamAVNet, AdapterNet9Axis
+from avnet.models.avnet import TriStreamAVNet, AdapterNet9Axis, SPEED_SCALE
 from avnet.models.inekf import InEKF
 from avnet.train import train_tristream_avnet, evaluate_model
 from avnet.train_adapter import train_adapter_offline
@@ -90,12 +90,19 @@ def run_evaluation(avnet_model, adapter_model, eval_data, device='cpu', output_d
                 gyro_w = torch.tensor(gyro[i - window_size:i].T, dtype=torch.float32).unsqueeze(0).to(device)
                 mag_w = torch.tensor(mag[i - window_size:i].T, dtype=torch.float32).unsqueeze(0).to(device)
 
-                v_lon_t, dq_xyz_t = avnet_model(acc_w, gyro_w, mag_w)
-                v_lon = max(0.0, v_lon_t.item()) # speed cannot be negative
+                v_lon_norm, dq_xyz_t, p_stop_t = avnet_model(acc_w, gyro_w, mag_w, return_zupt=True)
+                v_lon = max(0.0, v_lon_norm.item() * SPEED_SCALE)  # Denormalize speed to m/s
                 dq_vec = dq_xyz_t.cpu().numpy()[0]
+                p_stop = p_stop_t.item()
 
-                # Update speed
-                inekf.update_ddodo(v_lon, w, N_vel=N_vel_dyn)
+                # Option 1: Hybrid DMDVDR InEKF Fusion
+                if p_stop > 0.5:
+                    # Vehicle at standstill: lock velocity to 0 and eliminate bias drift
+                    inekf.update_zupt()
+                else:
+                    # Vehicle moving: apply forward speed and Non-Holonomic Constraints (v_lat=0, v_up=0)
+                    inekf.update_ddodo(v_lon, w, N_vel=N_vel_dyn)
+                    inekf.update_nhc(w)
 
                 # Update attitude using filter's own estimated history (pure dead reckoning)
                 w_comp = np.sqrt(max(0.0, 1.0 - np.sum(dq_vec**2)))

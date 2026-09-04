@@ -16,7 +16,7 @@ class TestPipeline(unittest.TestCase):
 
     def tearDown(self):
         if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir)
+            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_attitude_loss(self):
         # Perfect match -> loss near 0
