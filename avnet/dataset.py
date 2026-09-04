@@ -276,9 +276,10 @@ class TriStreamDataset(Dataset):
     PyTorch Dataset for windowed Multi-Modal Tri-Stream AVNet training.
     Produces decoupled (acc, gyro, mag) windows + speed and delta quaternion targets.
     """
-    def __init__(self, data_dict_list, window_size=20, step=2):
+    def __init__(self, data_dict_list, window_size=20, step=2, augment=False):
         self.samples = []
         self.window_size = window_size
+        self.augment = augment
 
         if not isinstance(data_dict_list, list):
             data_dict_list = [data_dict_list]
@@ -352,7 +353,39 @@ class TriStreamDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        sample = self.samples[idx]
+        if not self.augment:
+            return sample
+
+        acc = sample['acc'].clone()
+        gyro = sample['gyro'].clone()
+        mag = sample['mag'].clone()
+
+        # 1. Random sensor bias jitter (forces model to ignore phone-specific DC offsets)
+        b_acc = (torch.rand(3, 1) - 0.5) * 0.3    # +/- 0.15 m/s^2 bias shift
+        b_gyro = (torch.rand(3, 1) - 0.5) * 0.02  # +/- 0.01 rad/s bias shift
+        b_mag = (torch.rand(3, 1) - 0.5) * 10.0   # +/- 5.0 uT magnetic cabin offset
+
+        # 2. Random vibration amplitude scale jitter (0.85x to 1.15x)
+        # Prevents memorizing specific vehicle suspension stiffness or mount dampening
+        vibe_scale = 0.85 + torch.rand(1).item() * 0.30
+
+        acc = (acc + b_acc) * vibe_scale
+        gyro = (gyro + b_gyro) * vibe_scale
+        mag = mag + b_mag
+
+        # 3. Gaussian sensor noise jitter (simulates varying MEMS chip quality)
+        acc = acc + torch.randn_like(acc) * 0.02
+        gyro = gyro + torch.randn_like(gyro) * 0.002
+
+        return {
+            'acc': acc,
+            'gyro': gyro,
+            'mag': mag,
+            'target_speed': sample['target_speed'],
+            'target_delta_q': sample['target_delta_q'],
+            'delta_dist': sample['delta_dist']
+        }
 
 
 # Legacy wrapper for backward compatibility with older tests
@@ -493,9 +526,9 @@ def create_dataloaders(root_dir='data', window_size=20, step=2, batch_size=64,
         print("Loading test files...")
         test_data = load_pair_list(test_pairs)
 
-    train_ds = TriStreamDataset(train_data, window_size=window_size, step=step)
-    val_ds = TriStreamDataset(val_data, window_size=window_size, step=step * 2)
-    test_ds = TriStreamDataset(test_data, window_size=window_size, step=step * 2)
+    train_ds = TriStreamDataset(train_data, window_size=window_size, step=step, augment=True)
+    val_ds = TriStreamDataset(val_data, window_size=window_size, step=step * 2, augment=False)
+    test_ds = TriStreamDataset(test_data, window_size=window_size, step=step * 2, augment=False)
 
     print(f"Windows extracted: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
 
