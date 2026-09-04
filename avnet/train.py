@@ -56,17 +56,22 @@ def evaluate_model(model, dataloader, device='cpu'):
             target_dq = batch['target_delta_q'].to(device)
 
             pred_speed, pred_dq = model(acc, gyro, mag)
+            pred_speed = torch.clamp(pred_speed, min=0.0, max=80.0)
 
             l_speed = F.smooth_l1_loss(pred_speed, target_speed)
             l_att = compute_attitude_loss(pred_dq, target_dq)
-            loss = l_speed + 5.0 * l_att
 
+            if torch.isnan(l_speed) or torch.isnan(l_att) or torch.isinf(l_speed) or torch.isinf(l_att):
+                continue
+
+            loss = l_speed + 5.0 * l_att
             val_loss_sum += loss.item() * acc.size(0)
             total_samples += acc.size(0)
 
             # Metrics
             speed_err = (pred_speed - target_speed).cpu().numpy().flatten()
-            speed_sq_errors.extend(speed_err ** 2)
+            valid_speed_err = speed_err[np.isfinite(speed_err)]
+            speed_sq_errors.extend(valid_speed_err ** 2)
 
             # Rotation angle error in degrees: theta = 2 * arccos(|q1 . q2|)
             q_p = torch.cat([pred_dq, torch.sqrt(torch.clamp(1.0 - torch.sum(pred_dq**2, dim=-1, keepdim=True), min=1e-7))], dim=-1)
@@ -76,14 +81,15 @@ def evaluate_model(model, dataloader, device='cpu'):
             dots = torch.clamp(torch.abs(torch.sum(q_p * q_t, dim=-1)), 0.0, 1.0)
             angle_rad = 2.0 * torch.acos(dots)
             angle_deg = torch.rad2deg(angle_rad).cpu().numpy().flatten()
-            att_deg_errors.extend(angle_deg)
+            valid_angle = angle_deg[np.isfinite(angle_deg)]
+            att_deg_errors.extend(valid_angle)
 
-    avg_val_loss = val_loss_sum / max(1, total_samples)
-    speed_rmse = np.sqrt(np.mean(speed_sq_errors))
-    mean_att_deg = np.mean(att_deg_errors)
+    avg_val_loss = (val_loss_sum / max(1, total_samples)) if total_samples > 0 else 0.0
+    speed_rmse = np.sqrt(np.mean(speed_sq_errors)) if len(speed_sq_errors) > 0 else 0.0
+    mean_att_deg = np.mean(att_deg_errors) if len(att_deg_errors) > 0 else 0.0
 
     return {
-        'val_loss': avg_val_loss,
+        'val_loss': float(avg_val_loss),
         'speed_rmse_mps': float(speed_rmse),
         'att_error_deg': float(mean_att_deg)
     }
@@ -138,6 +144,10 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             loss_att = compute_attitude_loss(pred_dq, target_dq)
             loss_total = loss_speed + lambda_att * loss_att
 
+            if torch.isnan(loss_total) or torch.isinf(loss_total):
+                optimizer.zero_grad()
+                continue
+
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -149,7 +159,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
             total_samples += batch_size
 
         scheduler.step()
-        epoch_train_loss = running_loss / max(1, total_samples)
+        epoch_train_loss = (running_loss / max(1, total_samples)) if total_samples > 0 else 0.0
         current_lr = scheduler.get_last_lr()[0]
 
         history['train_loss'].append(epoch_train_loss)
@@ -174,7 +184,7 @@ def train_tristream_avnet(model, train_loader, val_loader=None,
                   f"LR: {current_lr:.6f}")
 
             # Save best checkpoint
-            if val_loss < best_val_loss:
+            if np.isfinite(val_loss) and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_pth = os.path.join(checkpoint_dir, 'best_avnet_tristream.pth')
                 best_pkl = os.path.join(checkpoint_dir, 'best_avnet_tristream.pkl')

@@ -72,15 +72,23 @@ def load_iovnbd_csv(filepath, v_filepath=None):
     alt_col = [c for c in df.columns if 'ALTITUDE' in c][0]
     speed_col = [c for c in df.columns if 'SPEED' in c][0]
 
-    time_ms = df[time_col].astype(float).values
+    # Clean time and calculate dt
+    time_ms = pd.Series(df[time_col]).ffill().bfill().fillna(0.0).astype(float).values
     dt = np.diff(time_ms, prepend=time_ms[0]) / 1000.0
-    # Clean negative time jumps (e.g. logger restarts/pauses)
     dt[dt <= 0] = 0.1
     dt[0] = dt[1] if len(dt) > 1 else 0.1
 
-    acc = df[acc_cols[:3]].astype(float).values
-    gyro = df[gyro_cols[:3]].astype(float).values
-    mag = df[mag_cols[:3]].astype(float).values if len(mag_cols) >= 3 else np.zeros((len(df), 3))
+    # Clean and forward-fill sensor readings
+    acc = pd.DataFrame(df[acc_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
+    gyro = pd.DataFrame(df[gyro_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
+    if len(mag_cols) >= 3:
+        mag = pd.DataFrame(df[mag_cols[:3]]).ffill().bfill().fillna(0.0).values.astype(np.float32)
+    else:
+        mag = np.zeros((len(df), 3), dtype=np.float32)
+
+    acc = np.nan_to_num(acc, nan=0.0)
+    gyro = np.nan_to_num(gyro, nan=0.0)
+    mag = np.nan_to_num(mag, nan=0.0)
 
     # Auto-detect matching vehicle CAN file if not provided
     if v_filepath is None:
@@ -90,8 +98,16 @@ def load_iovnbd_csv(filepath, v_filepath=None):
             candidate_v = os.path.join(dir_name, 'V-' + base_name[2:])
             if os.path.exists(candidate_v):
                 v_filepath = candidate_v
+            else:
+                # Check sibling directory if in S-Dataset
+                candidate_v_alt = os.path.join(dir_name.replace('S-Dataset', 'V-Dataset').replace('S Dataset', 'V Dataset'), 'V-' + base_name[2:])
+                if os.path.exists(candidate_v_alt):
+                    v_filepath = candidate_v_alt
 
     has_vehicle_can = False
+    speed_kmh = None
+    lat = None
+    lon = None
 
     if v_filepath and os.path.exists(v_filepath):
         try:
@@ -100,32 +116,39 @@ def load_iovnbd_csv(filepath, v_filepath=None):
             if len(df_v) == len(df):
                 has_vehicle_can = True
                 # Vehicle CAN speed is continuous and millisecond-accurate at 10 Hz
-                v_speed_cols = [c for c in df_v.columns if 'Indicated Vehicle Speed' in c or 'Velocity' in c]
+                v_speed_cols = [c for c in df_v.columns if 'Indicated Vehicle Speed' in c or 'Velocity' in c or 'SPEED' in c]
                 if v_speed_cols:
-                    speed_kmh = df_v[v_speed_cols[0]].astype(float).values
+                    speed_kmh = df_v[v_speed_cols[0]].values
                 else:
-                    speed_kmh = df[speed_col].astype(float).values
+                    speed_kmh = df[speed_col].values
 
                 # Vehicle GPS position
-                v_lat_cols = [c for c in df_v.columns if 'Latitude' in c]
-                v_lon_cols = [c for c in df_v.columns if 'Longitude' in c]
+                v_lat_cols = [c for c in df_v.columns if 'Latitude' in c or 'LATITUDE' in c]
+                v_lon_cols = [c for c in df_v.columns if 'Longitude' in c or 'LONGITUDE' in c]
                 if v_lat_cols and v_lon_cols:
-                    lat = df_v[v_lat_cols[0]].astype(float).values
-                    lon = df_v[v_lon_cols[0]].astype(float).values
+                    lat = df_v[v_lat_cols[0]].values
+                    lon = df_v[v_lon_cols[0]].values
                 else:
-                    lat = df[lat_col].astype(float).values
-                    lon = df[lon_col].astype(float).values
+                    lat = df[lat_col].values
+                    lon = df[lon_col].values
         except Exception:
             pass
 
-    if not has_vehicle_can:
-        lat = df[lat_col].astype(float).values
-        lon = df[lon_col].astype(float).values
-        speed_kmh = df[speed_col].astype(float).values
+    if not has_vehicle_can or speed_kmh is None:
+        lat = df[lat_col].values
+        lon = df[lon_col].values
+        speed_kmh = df[speed_col].values
 
-    alt = df[alt_col].astype(float).values
-    speed_ms = speed_kmh / 3.6  # convert km/h to m/s
-    gt_distance_m = np.cumsum(speed_ms * dt)
+    # Clean and interpolate position and speed
+    lat = pd.Series(lat).ffill().bfill().fillna(0.0).astype(float).values
+    lon = pd.Series(lon).ffill().bfill().fillna(0.0).astype(float).values
+    alt = pd.Series(df[alt_col]).ffill().bfill().fillna(0.0).astype(float).values
+    speed_kmh = pd.Series(speed_kmh).ffill().bfill().fillna(0.0).astype(float).values
+
+    # Convert km/h to m/s, eliminate any residual NaNs, clip to realistic vehicular speed
+    speed_ms = np.nan_to_num(speed_kmh / 3.6, nan=0.0).astype(np.float32)
+    speed_ms = np.clip(speed_ms, 0.0, 70.0)
+    gt_distance_m = np.cumsum(speed_ms * dt).astype(np.float32)
 
     gt_enu = latlon_to_enu(lat, lon, alt)
 
@@ -170,9 +193,11 @@ def load_iovnbd_csv(filepath, v_filepath=None):
 def discover_paired_iovnbd_files(root_dir='data'):
     """
     Search root_dir for all synchronized (S-*.csv, V-*.csv) file pairs.
+    Automatically matches sibling directories (e.g. S-Dataset <-> V-Dataset)
+    and deduplicates by session name so there is no data leakage across splits.
     Returns list of (s_path, v_path) tuples.
     """
-    pairs = []
+    raw_pairs = []
     # Search in Synchronised directory first
     sync_dir = os.path.join(root_dir, 'Synchronised V abd S datasets')
     search_path = sync_dir if os.path.exists(sync_dir) else root_dir
@@ -184,11 +209,31 @@ def discover_paired_iovnbd_files(root_dir='data'):
         v_name = 'V-' + base_name[2:]
         v_path = os.path.join(dir_name, v_name)
         if os.path.exists(v_path):
-            pairs.append((s_path, v_path))
+            raw_pairs.append((s_path, v_path))
         else:
-            pairs.append((s_path, None))
+            # Check sibling directory if in S-Dataset
+            v_alt = os.path.join(dir_name.replace('S-Dataset', 'V-Dataset').replace('S Dataset', 'V Dataset'), v_name)
+            if os.path.exists(v_alt):
+                raw_pairs.append((s_path, v_alt))
+            else:
+                raw_pairs.append((s_path, None))
 
-    return pairs
+    # Deduplicate by session basename (e.g. S-M.csv, S-Y1.csv)
+    # Prefer pairs that have a valid v_path, and prefer 'Categorised' over 'Uncategorised'
+    unique_pairs = {}
+    for s_path, v_path in raw_pairs:
+        base = os.path.basename(s_path)
+        if base not in unique_pairs:
+            unique_pairs[base] = (s_path, v_path)
+        else:
+            # If current stored pair has no v_path but this one does, replace it
+            if unique_pairs[base][1] is None and v_path is not None:
+                unique_pairs[base] = (s_path, v_path)
+            # If both have v_path, prefer 'Categorised'
+            elif 'Categorised' in s_path:
+                unique_pairs[base] = (s_path, v_path)
+
+    return list(unique_pairs.values())
 
 
 class TriStreamDataset(Dataset):
@@ -227,7 +272,9 @@ class TriStreamDataset(Dataset):
                 gyro_win = gyro[start_idx:end_idx + 1].T # (3, W)
                 mag_win = mag[start_idx:end_idx + 1].T   # (3, W)
 
-                target_speed = speed[end_idx]
+                target_speed = float(speed[end_idx])
+                if np.isnan(target_speed) or np.isinf(target_speed):
+                    continue
 
                 # Compute relative quaternion delta: q_rel = q_start^-1 * q_end
                 q_s = quat[start_idx]
@@ -247,7 +294,14 @@ class TriStreamDataset(Dataset):
                     q_rel_vec = -q_rel_vec
                 target_delta_q = q_rel_vec[:3].astype(np.float32)
 
-                delta_dist = dist[end_idx] - dist[start_idx]
+                if np.isnan(target_delta_q).any() or np.isinf(target_delta_q).any():
+                    continue
+                if np.isnan(acc_win).any() or np.isnan(gyro_win).any() or np.isnan(mag_win).any():
+                    continue
+
+                delta_dist = float(dist[end_idx] - dist[start_idx])
+                if np.isnan(delta_dist) or np.isinf(delta_dist):
+                    delta_dist = 0.0
 
                 self.samples.append({
                     'acc': torch.tensor(acc_win, dtype=torch.float32),   # (3, W)
